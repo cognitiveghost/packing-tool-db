@@ -241,8 +241,8 @@ def test_falls_back_to_config_ini_when_env_var_unset(config_ini, server_root):
 def test_profile_manager_creates_a_per_process_log_file(config_ini, server_root):
     ProfileManager(config_path=str(config_ini))
 
-    log_dir = server_root / "Logs" / "PackingTool"
-    files = list(log_dir.glob("PackingTool_*.log"))
+    log_dir = server_root / "Logs" / "PackingTool-DB"
+    files = list(log_dir.glob("PackingTool-DB_*.log"))
     assert len(files) == 1
 
 

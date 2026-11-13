@@ -8,13 +8,13 @@ from shared.theme import current_tokens
 
 
 def test_saved_language_is_applied():
-    QSettings("PackingTool", "Language").setValue("language", "bg")
+    QSettings("PackingTool-DB", "Language").setValue("language", "bg")
     assert main.apply_saved_language() == "bg"
     assert i18n._("Restart now") == "Рестартирай сега"
 
 
 def test_default_is_english():
-    QSettings("PackingTool", "Language").remove("language")
+    QSettings("PackingTool-DB", "Language").remove("language")
     assert main.apply_saved_language() == "en"
 
 
@@ -83,7 +83,7 @@ def test_a_vetoed_language_restart_is_cancelled(main_window, monkeypatch):
         main_window.sidebar.languageRequested.emit("bg")
     finally:
         main_window._starting = False
-        QSettings("PackingTool", "Language").remove("language")
+        QSettings("PackingTool-DB", "Language").remove("language")
     assert relaunch.pending() is None  # cancelled: a later close must not restart
     assert started == []
 

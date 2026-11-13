@@ -16,7 +16,7 @@ APP_ROOT = Path(__file__).resolve().parent
 
 
 def apply_saved_language() -> str:
-    code = str(QSettings("PackingTool", "Language").value("language", i18n.DEFAULT_LANGUAGE))
+    code = str(QSettings("PackingTool-DB", "Language").value("language", i18n.DEFAULT_LANGUAGE))
     i18n.set_language(code, i18n.catalogue_files(APP_ROOT, code))
     return i18n.language()
 

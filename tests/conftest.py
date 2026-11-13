@@ -92,7 +92,7 @@ def _clear_fulfillment_server_path_env(monkeypatch):
 @pytest.fixture(scope="session", autouse=True)
 def _isolate_qsettings(tmp_path_factory):
     """Hermetic tests: resolve_server_path's QSettings layer must not read
-    (or write) the developer's real "PackingTool"/"Connection" settings —
+    (or write) the developer's real "PackingTool-DB"/"Connection" settings —
     a path saved via the Server Connection dialog on this machine would
     otherwise silently override the tmp_path server_root used everywhere
     below, the same class of leak _clear_fulfillment_server_path_env guards
@@ -244,7 +244,7 @@ def main_window(config_ini, server_root, qapp):
     # used before shows: the remembered client, which is the first listed.
     from PySide6.QtCore import QSettings
 
-    QSettings("PackingTool", "ClientSelection").setValue(
+    QSettings("PackingTool-DB", "ClientSelection").setValue(
         "last_client", seed.get_available_clients()[0]
     )
     window = MainWindow(config_path=str(config_ini))

@@ -57,7 +57,7 @@ def entry(session_id="2026-10-06_2", status="paused", **over) -> dict:
 @pytest.fixture
 def made(qapp, profile_manager, server_root):
     (server_root / "Sessions" / "CLIENT_TEST").mkdir(parents=True)
-    QSettings("PackingTool", "SessionBrowser").clear()
+    QSettings("PackingTool-DB", "SessionBrowser").clear()
     bridge = AppBridge()
     bridge.set_page("sessions")
     toasts = []
@@ -116,7 +116,7 @@ def test_loading_a_client_shows_the_loading_state_then_its_sessions(
     qapp, profile_manager, server_root
 ):
     (server_root / "Sessions" / "CLIENT_TEST").mkdir(parents=True)
-    QSettings("PackingTool", "SessionBrowser").clear()
+    QSettings("PackingTool-DB", "SessionBrowser").clear()
     bridge = AppBridge()
     page = SessionsPage(bridge, SessionRegistryManager(profile_manager),
                         SessionLockManager(profile_manager))
@@ -218,7 +218,7 @@ def test_the_switch_is_saved_and_stops_the_timer(made):
     assert made.bridge.sessions["auto"] is True
     made.bridge.setAutoRefresh(False)
     assert made.bridge.sessions["auto"] is False
-    assert QSettings("PackingTool", "SessionBrowser").value(
+    assert QSettings("PackingTool-DB", "SessionBrowser").value(
         "auto_refresh_enabled", True, type=bool) is False
     assert not made.page._timer.isActive()
     made.bridge.setAutoRefresh(True)

@@ -38,7 +38,7 @@ def apply_theme(app: QApplication, theme: str = THEME_DARK) -> None:
     tokens = themed_tokens(theme, load_bundled_fonts())
     app.setStyleSheet(build_stylesheet(tokens))
     app.setPalette(build_palette(tokens))
-    QSettings("PackingTool", "Theme").setValue("current_theme", theme)
+    QSettings("PackingTool-DB", "Theme").setValue("current_theme", theme)
     # Last, and after the app sheet: shared.theme is now the single record of
     # which theme is live, and this emits theme_notifier.changed.
     set_current(theme)
@@ -47,7 +47,7 @@ def apply_theme(app: QApplication, theme: str = THEME_DARK) -> None:
 def load_saved_theme(app: QApplication) -> str:
     # Before apply_theme: build_stylesheet reads the density when it runs.
     set_density(PACKING_DENSITY)
-    settings = QSettings("PackingTool", "Theme")
+    settings = QSettings("PackingTool-DB", "Theme")
     theme = settings.value("current_theme", THEME_DARK)
     apply_theme(app, theme)
     return theme
@@ -64,5 +64,5 @@ def current_tokens() -> ThemeTokens:
     if name is None:
         # Nothing applied yet (a dialog constructed before load_saved_theme,
         # or a test importing the module standalone).
-        name = QSettings("PackingTool", "Theme").value("current_theme", THEME_DARK)
+        name = QSettings("PackingTool-DB", "Theme").value("current_theme", THEME_DARK)
     return themed_tokens(name, load_bundled_fonts())

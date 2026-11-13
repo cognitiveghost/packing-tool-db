@@ -98,7 +98,7 @@ class SessionsPage(QObject):
         # (resume payload, the stale lock) while frame 7c is open.
         self._pending: tuple[dict, dict] | None = None
 
-        self._settings = QSettings("PackingTool", "SessionBrowser")
+        self._settings = QSettings("PackingTool-DB", "SessionBrowser")
         self._auto = self._settings.value("auto_refresh_enabled", True, type=bool)
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._on_tick)

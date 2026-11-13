@@ -85,6 +85,8 @@ from shared.web_page import switch_theme, when_painted
 
 logger = logging.getLogger(__name__)
 
+_DB_TRIAL = " (DB trial)"  # brand suffix, not translated
+
 # (icon name, sidebar label, tooltip) per destination, in sidebar order. The
 # tooltip names the shortcut, as the mockup's does.
 RAIL_ITEMS = (
@@ -179,11 +181,11 @@ class MainWindow(QMainWindow):
                 Use a dev config (e.g. config.dev.ini) to point at a local mock server.
         """
         super().__init__()
-        self.setWindowTitle(f"{APP_NAME} {__version__}")
+        self.setWindowTitle(" ".join((APP_NAME, __version__)) + _DB_TRIAL)
 
         from shared.theme import restore_window_geometry
 
-        self._geometry_settings = QSettings("PackingTool", "MainWindowGeometry")
+        self._geometry_settings = QSettings("PackingTool-DB", "MainWindowGeometry")
         if not restore_window_geometry(self, self._geometry_settings):
             self.resize(1366, 768)
 
@@ -202,7 +204,7 @@ class MainWindow(QMainWindow):
                 break
             except NetworkError as e:
                 logger.exception("Failed to initialize ProfileManager")
-                if prompt_for_recovery_path(self, str(e), "PackingTool"):
+                if prompt_for_recovery_path(self, str(e), "PackingTool-DB"):
                     continue
                 sys.exit(1)
             except Exception as e:
@@ -276,7 +278,7 @@ class MainWindow(QMainWindow):
         self.stats_manager = StatsManager(base_path=str(base_path))
 
         # Settings for remembering last client
-        self.settings = QSettings("PackingTool", "ClientSelection")
+        self.settings = QSettings("PackingTool-DB", "ClientSelection")
 
         if self._is_test_mode:
             # Test mode - use dummy worker
@@ -406,7 +408,7 @@ class MainWindow(QMainWindow):
         self.sidebar.languageRequested.connect(lambda code: self._switch_language(code))
         self.sidebar.set_worker(self.current_worker_name or "")
         self.command_bar.sidebarToggled.connect(self._toggle_sidebar)
-        self._shell_settings = QSettings("PackingTool", "Shell")
+        self._shell_settings = QSettings("PackingTool-DB", "Shell")
         self._set_sidebar_expanded(
             self._shell_settings.value("sidebar_expanded", True, type=bool)
         )
@@ -469,7 +471,7 @@ class MainWindow(QMainWindow):
         self._init_overflow()
         self.update_flow = UpdateFlow(
             self, self.sidebar.update_button, self._toast,
-            AppIdentity("cognitiveghost/packing-tool", "PackerAssistant", "PackerAssistant.exe"),
+            AppIdentity("cognitiveghost/packing-tool-db", "PackerAssistant-DB", "PackerAssistant-DB.exe"),
             __version__,
         )
         self.update_flow.start()
@@ -517,7 +519,7 @@ class MainWindow(QMainWindow):
     def _switch_language(self, code: str):
         """English or Bulgarian, from the sidebar's segment. The window keeps its
         language until the restart; the segment shows the saved choice."""
-        settings = QSettings("PackingTool", "Language")
+        settings = QSettings("PackingTool-DB", "Language")
         switch_language(self, settings, code)
         self.sidebar.language_segment.set_language(str(settings.value("language", "en")))
 
@@ -919,7 +921,7 @@ class MainWindow(QMainWindow):
             "Network", "FileServerPath", fallback=None
         )
         ConnectionSettingsDialog(
-            self, "PackingTool", "FULFILLMENT_SERVER_PATH", config_fallback
+            self, "PackingTool-DB", "FULFILLMENT_SERVER_PATH", config_fallback
         ).exec()
 
     def open_sku_mapping(self) -> None:

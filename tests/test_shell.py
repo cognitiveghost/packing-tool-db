@@ -236,7 +236,7 @@ def test_the_destinations_are_the_mockups_three(window):
 
 
 def test_the_collapse_button_collapses_and_the_choice_is_remembered(window):
-    settings = QSettings("PackingTool", "Shell")
+    settings = QSettings("PackingTool-DB", "Shell")
     assert window.sidebar.is_expanded()
     window.command_bar.sidebar_button.click()
     try:
@@ -267,4 +267,4 @@ def test_ending_a_session_clears_the_session_tooltip(window):
 def test_the_title_names_the_app_and_its_version(window):
     from packing_tool import APP_NAME, __version__
 
-    assert window.windowTitle() == f"{APP_NAME} {__version__}"
+    assert window.windowTitle() == f"{APP_NAME} {__version__} (DB trial)"

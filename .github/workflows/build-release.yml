@@ -167,20 +167,20 @@ jobs:
         shell: pwsh
         run: |
           foreach ($name in "package.svg", "Inter-Regular.ttf", "QtWebEngineProcess.exe", "packer.html", "app.html", "setup.html", "kit.css", "page.js", "packer-assistant.ico", "qico.dll", "bg.json", "scan-barcode.svg", "download.svg") {
-            if (-not (Get-ChildItem -Path "dist\PackerAssistant" -Recurse -Filter $name)) {
+            if (-not (Get-ChildItem -Path "dist\PackerAssistant-DB" -Recurse -Filter $name)) {
               throw "PyInstaller did not bundle $name -- the app would not start."
             }
           }
       - name: Zip the bundle
         shell: pwsh
         run: |
-          $name = if ($env:VERSION) { "PackerAssistant-$env:VERSION" } else { "PackerAssistant-gate" }
-          Compress-Archive -Path "dist\PackerAssistant\*" -DestinationPath "$name.zip"
+          $name = if ($env:VERSION) { "PackerAssistant-DB-$env:VERSION" } else { "PackerAssistant-DB-gate" }
+          Compress-Archive -Path "dist\PackerAssistant-DB\*" -DestinationPath "$name.zip"
       - name: Upload the bundle
         uses: actions/upload-artifact@v7
         with:
           name: bundle
-          path: PackerAssistant-*.zip
+          path: PackerAssistant-DB-*.zip
           # Already a zip; re-compressing several hundred MB buys nothing.
           compression-level: 0
 
@@ -203,11 +203,11 @@ jobs:
         with:
           name: bundle
       - name: Checksum
-        run: sha256sum "PackerAssistant-$VERSION.zip" > "PackerAssistant-$VERSION.zip.sha256"
+        run: sha256sum "PackerAssistant-DB-$VERSION.zip" > "PackerAssistant-DB-$VERSION.zip.sha256"
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v4
         with:
-          subject-path: PackerAssistant-${{ needs.version.outputs.version }}.zip
+          subject-path: PackerAssistant-DB-${{ needs.version.outputs.version }}.zip
       - name: Create the release
         # Last, so a failed build or attestation leaves no tag behind.
         env:
@@ -215,6 +215,6 @@ jobs:
           RELEASE_KIND: ${{ inputs.prerelease && '--prerelease' || '--latest' }}
         run: >
           gh release create "$VERSION"
-          "PackerAssistant-$VERSION.zip" "PackerAssistant-$VERSION.zip.sha256"
+          "PackerAssistant-DB-$VERSION.zip" "PackerAssistant-DB-$VERSION.zip.sha256"
           --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA"
           --title "$VERSION" --generate-notes $RELEASE_KIND

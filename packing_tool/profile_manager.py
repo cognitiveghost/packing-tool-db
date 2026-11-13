@@ -85,7 +85,7 @@ class ProfileManager:
         # a path saved via the Server Connection UI, then config.ini.
         config_fallback = self.config.get('Network', 'FileServerPath', fallback=None)
         file_server_path = resolve_server_path(
-            "PackingTool", "FULFILLMENT_SERVER_PATH", config_fallback
+            "PackingTool-DB", "FULFILLMENT_SERVER_PATH", config_fallback
         )
         if not file_server_path:
             raise ProfileManagerError(
@@ -108,7 +108,7 @@ class ProfileManager:
         log_level_str = self.config.get('Logging', 'LogLevel', fallback='INFO')
         log_level = getattr(logging, log_level_str.upper(), logging.INFO)
         retention_days = self.config.getint('Logging', 'LogRetentionDays', fallback=30)
-        setup_logging("PackingTool", str(self.base_path), level=log_level, retention_days=retention_days)
+        setup_logging("PackingTool-DB", str(self.base_path), level=log_level, retention_days=retention_days)
 
         # Local cache directory
         cache_path = self.config.get('Network', 'LocalCachePath', fallback='')

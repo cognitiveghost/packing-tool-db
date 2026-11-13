@@ -10,7 +10,7 @@ from packing_tool.profile_manager import ProfileManager
 
 @pytest.fixture
 def remembered():
-    settings = QSettings("PackingTool", "ClientSelection")
+    settings = QSettings("PackingTool-DB", "ClientSelection")
     settings.remove("last_client")
     yield settings
     settings.remove("last_client")
@@ -147,7 +147,7 @@ def test_the_shortcuts_do_nothing_without_a_client(config_ini, qapp, remembered)
 
 
 def test_a_collapsed_sidebar_is_restored_at_startup(config_ini, qapp, remembered):
-    shell = QSettings("PackingTool", "Shell")
+    shell = QSettings("PackingTool-DB", "Shell")
     shell.setValue("sidebar_expanded", False)
     try:
         window = _window(config_ini, ["ALPHA"])
