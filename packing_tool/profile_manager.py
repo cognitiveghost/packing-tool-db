@@ -6,19 +6,17 @@ directories on a centralized file server. It provides robust file locking for
 concurrent access, caching for performance, and connection testing.
 """
 import configparser
-import json
+import contextlib
+import fnmatch
 import logging
 import os
 import re
-import shutil
-from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
-from shared.atomic_write import atomic_write_json
-from shared.file_lock import FileLockError, locked_file
 from shared.logger import setup_logging
 from shared.server_connection import resolve_server_path, test_path_reachable
+from shared.store import FileStore, StoreError
 
 logger = logging.getLogger(__name__)
 
@@ -93,12 +91,13 @@ class ProfileManager:
                 "use Settings → Server Connection, or add FileServerPath to config.ini"
             )
 
-        self.base_path = Path(file_server_path)
-        self.clients_dir = self.base_path / "Clients"
-        self.sessions_dir = self.base_path / "Sessions"
-        self.workers_dir = self.base_path / "Workers"
-        self.stats_dir = self.base_path / "Stats"
-        self.logs_dir = self.base_path / "Logs"
+        self.store = FileStore(file_server_path)
+        self.base_path = self.store.root
+        self.clients_dir = self.store.local_path("Clients")
+        self.sessions_dir = self.store.local_path("Sessions")
+        self.workers_dir = self.store.local_path("Workers")
+        self.stats_dir = self.store.local_path("Stats")
+        self.logs_dir = self.store.local_path("Logs")
 
         # Per-process log file on the same server ProfileManager itself
         # resolved (base_path) - previously logger.py re-read config.ini
@@ -164,11 +163,9 @@ class ProfileManager:
     def _ensure_directories(self):
         """Create base directory structure if it doesn't exist."""
         try:
-            self.clients_dir.mkdir(parents=True, exist_ok=True)
-            self.sessions_dir.mkdir(parents=True, exist_ok=True)
-            self.workers_dir.mkdir(parents=True, exist_ok=True)
-            self.stats_dir.mkdir(parents=True, exist_ok=True)
-            self.logs_dir.mkdir(parents=True, exist_ok=True)
+            # claim_dir is mkdir(parents=True), and says False rather than raising when it exists
+            for rel in ("Clients", "Sessions", "Workers", "Stats", "Logs"):
+                self.store.claim_dir(rel)
             logger.debug("Directory structure verified")
         except Exception as e:
             logger.exception("Cannot create directories")
@@ -229,16 +226,17 @@ class ProfileManager:
         Returns:
             List of client IDs (without "CLIENT_" prefix)
         """
-        if not self.clients_dir.exists():
+        if not self.store.exists("Clients"):
             logger.warning("Clients directory does not exist")
             return []
 
         try:
-            clients = []
-            for d in self.clients_dir.iterdir():
-                if d.is_dir() and d.name.startswith("CLIENT_"):
-                    client_id = d.name[len("CLIENT_"):]
-                    clients.append(client_id)
+            # a client is a folder with something in it (the Store has no is_dir)
+            clients = [
+                name[len("CLIENT_"):]
+                for name in self.store.list_dir("Clients")
+                if name.startswith("CLIENT_") and self.store.list_dir(f"Clients/{name}")
+            ]
 
             logger.debug(f"Found {len(clients)} clients: {clients}")
             return sorted(clients)
@@ -269,15 +267,14 @@ class ProfileManager:
         if not is_valid:
             raise ValidationError(error_msg)
 
-        client_dir = self.clients_dir / f"CLIENT_{client_id}"
+        client_dir = f"Clients/CLIENT_{client_id}"
 
-        if client_dir.exists():
+        # Claim before the try: a lost race must not clean up the winner's folder
+        if not self.store.claim_dir(client_dir):
             logger.warning(f"Client {client_id} already exists")
             return False
 
         try:
-            # Create client directory
-            client_dir.mkdir(parents=True)
             logger.debug(f"Created client directory: {client_dir}")
 
             # Create default packer_config with SKU mapping integrated
@@ -315,11 +312,8 @@ class ProfileManager:
                 "updated_by": os.environ.get('COMPUTERNAME', 'Unknown')
             }
 
-            packer_config_path = client_dir / "packer_config.json"
-            with open(packer_config_path, 'w', encoding='utf-8') as f:
-                json.dump(default_packer_config, f, indent=2, ensure_ascii=False)
-
-            logger.debug(f"Created packer_config: {packer_config_path}")
+            self.store.write_json(f"{client_dir}/packer_config.json", default_packer_config)
+            logger.debug(f"Created packer_config: {client_dir}/packer_config.json")
 
             # Also create client_config.json for compatibility with Shopify Tool
             client_config = {
@@ -328,18 +322,14 @@ class ProfileManager:
                 "created_at": datetime.now().astimezone().isoformat()
             }
 
-            client_config_path = client_dir / "client_config.json"
-            with open(client_config_path, 'w', encoding='utf-8') as f:
-                json.dump(client_config, f, indent=2, ensure_ascii=False)
-
-            logger.debug(f"Created client_config: {client_config_path}")
+            self.store.write_json(f"{client_dir}/client_config.json", client_config)
+            logger.debug(f"Created client_config: {client_dir}/client_config.json")
 
             # Create backups directory
-            (client_dir / "backups").mkdir(exist_ok=True)
+            self.store.claim_dir(f"{client_dir}/backups")
 
             # Create session directory for this client
-            client_sessions = self.sessions_dir / f"CLIENT_{client_id}"
-            client_sessions.mkdir(exist_ok=True)
+            self.store.claim_dir(f"Sessions/CLIENT_{client_id}")
 
             logger.info(f"Successfully created client profile: {client_id}")
             return True
@@ -347,8 +337,8 @@ class ProfileManager:
         except Exception as e:
             logger.exception("Failed to create client profile")
             # Cleanup on failure
-            if client_dir.exists():
-                shutil.rmtree(client_dir, ignore_errors=True)
+            with contextlib.suppress(Exception):
+                self.store.delete(client_dir)
             raise ProfileManagerError(f"Failed to create client profile: {e}")
 
     def load_client_config(self, client_id: str) -> dict | None:
@@ -372,23 +362,22 @@ class ProfileManager:
                 return cached_data.copy()
 
         # Load from disk - try packer_config.json first, then fall back to config.json
-        packer_config_path = self.clients_dir / f"CLIENT_{client_id}" / "packer_config.json"
-        config_path = self.clients_dir / f"CLIENT_{client_id}" / "config.json"
+        packer_config_rel = f"Clients/CLIENT_{client_id}/packer_config.json"
+        config_rel = f"Clients/CLIENT_{client_id}/config.json"
 
-        path_to_use = packer_config_path if packer_config_path.exists() else config_path
+        rel_to_use = packer_config_rel if self.store.exists(packer_config_rel) else config_rel
 
-        if not path_to_use.exists():
+        if not self.store.exists(rel_to_use):
             logger.warning(f"Config not found for client {client_id}")
             return None
 
         try:
-            with open(path_to_use, 'r', encoding='utf-8') as f:
-                config = json.load(f)
+            config = self.store.read_json(rel_to_use)
 
             # Update cache
             self._config_cache[cache_key] = (config, datetime.now().astimezone())
 
-            logger.debug(f"Loaded config for client {client_id} from {path_to_use.name}")
+            logger.debug(f"Loaded config for client {client_id} from {rel_to_use.rsplit('/', 1)[-1]}")
             return config.copy()
 
         except Exception:
@@ -406,20 +395,19 @@ class ProfileManager:
         Returns:
             True if saved successfully
         """
-        packer_config_path = self.clients_dir / f"CLIENT_{client_id}" / "packer_config.json"
+        packer_config_rel = f"Clients/CLIENT_{client_id}/packer_config.json"
 
         try:
             # Create backup before overwriting
-            if packer_config_path.exists():
-                self._create_backup(client_id, packer_config_path, "packer_config")
+            if self.store.exists(packer_config_rel):
+                self._create_backup(client_id, packer_config_rel, "packer_config")
 
             # Update timestamp
             config['last_updated'] = datetime.now().astimezone().isoformat()
             config['updated_by'] = os.environ.get('COMPUTERNAME', 'Unknown')
 
             # Save new config
-            with open(packer_config_path, 'w', encoding='utf-8') as f:
-                json.dump(config, f, indent=2, ensure_ascii=False)
+            self.store.write_json(packer_config_rel, config)
 
             # Invalidate cache
             cache_key = f"config_{client_id}"
@@ -432,23 +420,26 @@ class ProfileManager:
             logger.exception(f"Error saving config for {client_id}")
             return False
 
-    def _create_backup(self, client_id: str, file_path: Path, file_type: str):
+    def _create_backup(self, client_id: str, file_rel: str, file_type: str):
         """Create timestamped backup of a file."""
-        backup_dir = self.clients_dir / f"CLIENT_{client_id}" / "backups"
-        backup_dir.mkdir(exist_ok=True)
+        backup_dir = f"Clients/CLIENT_{client_id}/backups"
+        self.store.claim_dir(backup_dir)
 
         timestamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
-        backup_path = backup_dir / f"{file_type}_{timestamp}.json"
+        backup_rel = f"{backup_dir}/{file_type}_{timestamp}.json"
 
         try:
-            shutil.copy2(file_path, backup_path)
-            logger.debug(f"Created backup: {backup_path}")
+            self.store.write_bytes(backup_rel, self.store.read_bytes(file_rel))
+            logger.debug(f"Created backup: {backup_rel}")
 
             # Keep only last 10 backups
-            backups = sorted(backup_dir.glob(f"{file_type}_*.json"))
+            backups = sorted(
+                name for name in self.store.list_dir(backup_dir)
+                if fnmatch.fnmatch(name, f"{file_type}_*.json")
+            )
             for old_backup in backups[:-10]:
-                old_backup.unlink()
-                logger.debug(f"Deleted old backup: {old_backup.name}")
+                self.store.delete(f"{backup_dir}/{old_backup}")
+                logger.debug(f"Deleted old backup: {old_backup}")
 
         except Exception as e:
             logger.warning(f"Failed to create backup: {e}")
@@ -480,31 +471,29 @@ class ProfileManager:
                 return cached_data.copy()
 
         # Load from packer_config.json first, fall back to sku_mapping.json
-        packer_config_path = self.clients_dir / f"CLIENT_{client_id}" / "packer_config.json"
-        mapping_path = self.clients_dir / f"CLIENT_{client_id}" / "sku_mapping.json"
+        packer_config_rel = f"Clients/CLIENT_{client_id}/packer_config.json"
+        mapping_rel = f"Clients/CLIENT_{client_id}/sku_mapping.json"
 
         mappings = {}
 
         # Try packer_config.json first. A failed read raises, and is never
         # cached: an empty table read mid-rewrite is not "no mappings" (AUDIT-02-3).
-        if packer_config_path.exists():
+        if self.store.exists(packer_config_rel):
             try:
-                with open(packer_config_path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    mappings = data.get("sku_mapping", {})
+                data = self.store.read_json(packer_config_rel)
+                mappings = data.get("sku_mapping", {})
                 logger.debug(f"Loaded {len(mappings)} SKU mappings from packer_config for {client_id}")
-            except (OSError, ValueError) as e:
+            except StoreError as e:
                 logger.exception(f"Error loading SKU mapping from packer_config for {client_id}")
                 raise ProfileManagerError(
                     f"Could not read the SKU mapping from the file server: {e}"
                 ) from e
 
         # Fall back to old sku_mapping.json if packer_config doesn't have mappings
-        if not mappings and mapping_path.exists():
+        if not mappings and self.store.exists(mapping_rel):
             try:
-                with open(mapping_path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    mappings = data.get("mappings", {})
+                data = self.store.read_json(mapping_rel)
+                mappings = data.get("mappings", {})
                 logger.debug(f"Loaded {len(mappings)} SKU mappings from sku_mapping.json for {client_id}")
             except Exception:
                 logger.exception(f"Error loading SKU mapping from sku_mapping.json for {client_id}")
@@ -513,41 +502,29 @@ class ProfileManager:
 
         return mappings.copy()
 
-    @contextmanager
-    def _packer_config_locked(self, client_id: str):
-        """Hold packer_config.json's sidecar lock for one read-modify-write.
-
-        A sidecar, as the session registry does: the file itself is replaced by
-        rename, so no reader ever sees it half-written (AUDIT-02-3).
-        """
-        path = self.clients_dir / f"CLIENT_{client_id}" / "packer_config.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path.with_name(path.name + ".lock"), "a+") as handle, locked_file(handle):
-            yield path
-
     def _change_sku_mapping(self, client_id: str, change) -> dict[str, str]:
         """Apply change(mapping) to the mapping as it is on disk now, under the lock.
 
         An unreadable packer_config.json raises: a mapping read as empty must
         never be saved over the real one.
         """
+        packer_config_rel = f"Clients/CLIENT_{client_id}/packer_config.json"
+        legacy_rel = f"Clients/CLIENT_{client_id}/sku_mapping.json"
+
+        def edit(current):
+            config = current if current is not None else {"client_id": client_id, "sku_mapping": {}}
+            mapping = dict(config.get("sku_mapping") or {})
+            if not mapping and self.store.exists(legacy_rel):
+                mapping = dict(self.store.read_json(legacy_rel).get("mappings", {}))
+            change(mapping)
+            config["sku_mapping"] = mapping
+            config["last_updated"] = datetime.now().astimezone().isoformat()
+            config["updated_by"] = os.environ.get("COMPUTERNAME", "Unknown")
+            return config
+
         try:
-            with self._packer_config_locked(client_id) as path:
-                config = {"client_id": client_id, "sku_mapping": {}}
-                if path.exists():
-                    with open(path, "r", encoding="utf-8") as f:
-                        config = json.load(f)
-                mapping = dict(config.get("sku_mapping") or {})
-                legacy = path.with_name("sku_mapping.json")
-                if not mapping and legacy.exists():
-                    with open(legacy, "r", encoding="utf-8") as f:
-                        mapping = dict(json.load(f).get("mappings", {}))
-                change(mapping)
-                config["sku_mapping"] = mapping
-                config["last_updated"] = datetime.now().astimezone().isoformat()
-                config["updated_by"] = os.environ.get("COMPUTERNAME", "Unknown")
-                atomic_write_json(path, config, indent=2, ensure_ascii=False)
-        except (OSError, ValueError, FileLockError) as e:
+            config = self.store.update_json(packer_config_rel, edit)
+        except StoreError as e:
             logger.exception(f"Could not save SKU mapping for {client_id}")
             raise ProfileManagerError(
                 f"Could not save the SKU mapping to the file server: {e}"
@@ -555,6 +532,7 @@ class ProfileManager:
         finally:
             self._sku_cache.pop(f"sku_{client_id}", None)
             self._config_cache.pop(f"config_{client_id}", None)
+        mapping = config["sku_mapping"]
         logger.info(f"Saved SKU mapping for {client_id}: {len(mapping)} entries")
         return mapping
 

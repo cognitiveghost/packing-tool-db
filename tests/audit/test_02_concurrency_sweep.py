@@ -17,6 +17,7 @@ from packing_tool.profile_manager import ProfileManager, ProfileManagerError
 from packing_tool.session_lock_manager import SessionLockManager
 from packing_tool.session_registry_manager import SessionRegistryManager
 from packing_tool.worker_manager import WorkerManager
+from shared.store import FileStore
 
 
 def _lock(work_dir: Path, by: str, age_seconds: int, pid: int = 1):
@@ -134,19 +135,20 @@ def test_an_unreadable_mapping_file_is_not_saved_over(config_ini, monkeypatch):
 
 
 def test_two_pcs_ending_sessions_together_both_count(server_root):
-    pc1, pc2 = WorkerManager(str(server_root)), WorkerManager(str(server_root))
+    pc1, pc2 = WorkerManager(FileStore(server_root)), WorkerManager(FileStore(server_root))
     worker = pc1.create_worker("Ana")
 
     loaded, release = threading.Event(), threading.Event()
-    plain_load = pc1._load_workers_registry
+    plain_read = pc1.store.read_json
 
-    def slow_load():
-        data = plain_load()
+    def slow_read(rel):
+        data = plain_read(rel)
         loaded.set()
         release.wait(2)
         return data
 
-    pc1._load_workers_registry = slow_load
+    # update_json reads the registry under its lock; hold that read open
+    pc1.store.read_json = slow_read
     first = threading.Thread(target=lambda: pc1.update_worker_stats(worker.id, orders=3))
     first.start()
     loaded.wait(2)

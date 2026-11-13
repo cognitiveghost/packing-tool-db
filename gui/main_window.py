@@ -234,8 +234,7 @@ class MainWindow(QMainWindow):
         logger.info("SessionLockManager initialized successfully")
 
         # Initialize WorkerManager
-        base_path = self.profile_manager.base_path
-        self.worker_manager = WorkerManager(str(base_path))
+        self.worker_manager = WorkerManager(self.profile_manager.store)
         logger.info("WorkerManager initialized successfully")
 
         # Initialize SessionRegistryManager (per-client index for fast browser loading)
@@ -275,7 +274,7 @@ class MainWindow(QMainWindow):
         # 3. Warehouse operation audit trail and worker performance metrics
         # 4. Per-client analytics and reporting
         # Note: Called once per session (at completion) by design - records session totals
-        self.stats_manager = StatsManager(base_path=str(base_path))
+        self.stats_manager = StatsManager(self.profile_manager.store)
 
         # Settings for remembering last client
         self.settings = QSettings("PackingTool-DB", "ClientSelection")
@@ -552,7 +551,7 @@ class MainWindow(QMainWindow):
         help_shortcut.activated.connect(self._open_user_guide)
 
     def _open_user_guide(self):
-        open_guide(self, str(self.profile_manager.base_path), "packing-tool")
+        open_guide(self, self.profile_manager.store, "packing-tool")
 
     def _go_to_page(self, page: int):
         """Ctrl+1/2/3. Nothing to go to until a client is chosen, and not
