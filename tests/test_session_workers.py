@@ -4,6 +4,7 @@ import json
 
 from gui.workers import RegistryRefreshWorker, SessionDetailsWorker
 from packing_tool.session_registry_manager import SessionRegistryManager
+from shared.store import FileStore
 
 
 def test_a_refresh_returns_the_clients_entries(qtbot, profile_manager, server_root):
@@ -27,6 +28,18 @@ def test_a_refresh_with_the_server_away_fails_with_the_cause(qtbot, profile_mana
     assert caught.args[1]  # the OS's own words
 
 
+def test_a_refresh_with_an_unreadable_registry_fails_and_lists_nothing(qtbot, profile_manager, server_root):
+    """An unreadable registry is a failed refresh, not an empty list (StoreError is re-raised)."""
+    client = server_root / "Sessions" / "CLIENT_TEST"
+    client.mkdir(parents=True)
+    (client / "registry_index.json").write_text("{", encoding="utf-8")
+    worker = RegistryRefreshWorker(SessionRegistryManager(profile_manager), "TEST")
+    with qtbot.waitSignal(worker.refresh_failed, timeout=10000) as caught:
+        worker.start()
+    worker.wait(10000)
+    assert caught.args[0] == "TEST"
+    assert caught.args[1]
+
 def test_details_are_loaded_off_the_ui_thread(qtbot, tmp_path):
     work_dir = tmp_path / "2026-09-29_1" / "packing" / "DHL_Orders"
     work_dir.mkdir(parents=True)
@@ -34,7 +47,7 @@ def test_details_are_loaded_off_the_ui_thread(qtbot, tmp_path):
         json.dumps({"session_id": "2026-09-29_1", "total_orders": 3}), encoding="utf-8"
     )
     entry = {"session_id": "2026-09-29_1", "packing_list_name": "DHL_Orders", "work_dir": str(work_dir)}
-    worker = SessionDetailsWorker("2026-09-29_1|DHL_Orders", entry)
+    worker = SessionDetailsWorker("2026-09-29_1|DHL_Orders", entry, FileStore(tmp_path))
     with qtbot.waitSignal(worker.loaded, timeout=10000) as caught:
         worker.start()
     worker.wait(10000)
@@ -48,7 +61,7 @@ def test_details_that_cannot_be_read_report_the_file(qtbot, tmp_path):
     work_dir.mkdir(parents=True)
     (work_dir / "packing_state.json").write_text("{", encoding="utf-8")
     entry = {"session_id": "2026-09-29_1", "packing_list_name": "DHL_Orders", "work_dir": str(work_dir)}
-    worker = SessionDetailsWorker("k", entry)
+    worker = SessionDetailsWorker("k", entry, FileStore(tmp_path))
     with qtbot.waitSignal(worker.failed, timeout=10000) as caught:
         worker.start()
     worker.wait(10000)

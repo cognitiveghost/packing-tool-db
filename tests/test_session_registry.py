@@ -8,6 +8,7 @@ import pytest
 from packing_tool.session_lock_manager import SessionLockManager
 from packing_tool.session_registry_manager import SessionRegistryManager
 from shared.metadata_utils import get_current_timestamp
+from shared.store import StoreError
 
 
 @pytest.fixture
@@ -308,3 +309,20 @@ def test_an_unreadable_rewrite_keeps_the_old_entry(registry, profile_manager):
     registry.refresh_available_lists("M")
     [entry] = registry.get_available_lists("M")
     assert entry["total_orders"] == 16
+
+
+def test_a_registry_that_is_not_there_reads_empty(registry):
+    assert registry.read_registry("M")["sessions"] == {}
+
+
+@pytest.mark.parametrize("damage", ["corrupt", "directory"])
+def test_a_registry_that_cannot_be_read_raises_rather_than_reading_empty(registry, profile_manager, damage):
+    """An empty answer during an outage read as "no sessions yet" and was written back over the real list."""
+    path = profile_manager.store.local_path("Sessions/CLIENT_M/registry_index.json")
+    path.parent.mkdir(parents=True)
+    if damage == "corrupt":
+        path.write_text("{", encoding="utf-8")
+    else:
+        path.mkdir()
+    with pytest.raises(StoreError):
+        registry.read_registry("M")

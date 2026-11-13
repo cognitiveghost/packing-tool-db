@@ -110,7 +110,8 @@ def _session(session_id, work_dir="") -> dict:
 
 
 def _files(tmp_path, session_id, order):
-    work_dir = tmp_path / session_id / "packing" / "DHL_Orders"
+    # Under the server root (conftest's server_root): the Packer reads sessions through its store.
+    work_dir = tmp_path / "server" / "Sessions" / "CLIENT_TESTCL" / session_id / "packing" / "DHL_Orders"
     work_dir.mkdir(parents=True)
     summary = {
         "session_id": session_id, "packing_list_name": "DHL_Orders",

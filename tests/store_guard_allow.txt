@@ -2,8 +2,7 @@
 # A file listed here is exempt from tests/test_store_guard.py as a whole. Reasons:
 #   TODO-migrate(5b|5c) = belongs to a later Task 5 part; remove the line when migrated.
 #   anything else       = genuinely local file (export target, temp dir, app data, logs).
-packing_tool/session_registry_manager.py:TODO-migrate(5b) registry read-modify-write under its sidecar lock
-packing_tool/session_manager.py:TODO-migrate(5b) session info read-modify-write under its sidecar lock
+packing_tool/session_registry_manager.py:registry_index.json: FileStore-only derived cache, replaced in Task 9
 packing_tool/packer_logic.py:TODO-migrate(5c) packer state and session summary writes
 packing_tool/session_lock_manager.py:TODO-migrate(5c) session lock file, becomes a wrapper over Store lock methods
 gui/main_window.py:TODO-migrate(5c) minimal session summary fallback written after a failed save

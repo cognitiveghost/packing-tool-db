@@ -36,6 +36,7 @@ from packing_tool.session_lock_manager import SessionLockManager
 from shared.atomic_write import atomic_write_json
 from shared.file_lock import FileLockError, locked_file
 from shared.metadata_utils import get_current_timestamp, parse_timestamp
+from shared.store import StoreError, StoreNotFound
 
 logger = logging.getLogger(__name__)
 
@@ -77,10 +78,8 @@ class SessionRegistryManager:
 
     def _get_registry_path(self, client_id: str) -> Path:
         """Return path to registry_index.json for the given client."""
-        return (
-            self.profile_manager.get_sessions_root()
-            / f"CLIENT_{client_id}"
-            / self.REGISTRY_FILENAME
+        return self.profile_manager.store.local_path(
+            f"Sessions/CLIENT_{client_id}/{self.REGISTRY_FILENAME}"
         )
 
     def _empty_registry(self, client_id: str) -> dict:
@@ -115,24 +114,32 @@ class SessionRegistryManager:
     #  Read / Write                                                        #
     # ------------------------------------------------------------------ #
 
+    def _load(self, client_id: str):
+        """registry_index.json as parsed JSON. StoreNotFound if absent, StoreError if unreadable."""
+        path = self._get_registry_path(client_id)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except FileNotFoundError:
+            raise StoreNotFound(str(path)) from None
+        except (OSError, ValueError) as e:  # ValueError covers JSONDecodeError
+            raise StoreError(str(e)) from e
+
     def read_registry(self, client_id: str) -> dict:
         """
         Load registry from disk.
 
-        Returns an empty registry structure if the file is missing or corrupt.
+        A missing file is an empty registry. A file that cannot be read raises
+        StoreError: an empty registry there reads as "no sessions" during an outage.
+        A readable file in an unexpected format is still an empty registry.
         """
-        path = self._get_registry_path(client_id)
         try:
-            if path.exists():
-                with open(path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if isinstance(data, dict) and data.get("version") == self.REGISTRY_VERSION:
-                    return data
-                logger.warning(
-                    f"Registry for client {client_id} has unexpected version/format, using empty."
-                )
-        except Exception as e:
-            logger.warning(f"Could not read registry for client {client_id}: {e}")
+            data = self._load(client_id)
+        except StoreNotFound:
+            return self._empty_registry(client_id)
+        if isinstance(data, dict) and data.get("version") == self.REGISTRY_VERSION:
+            return data
+        logger.warning(f"Registry for client {client_id} has unexpected version/format, using empty.")
         return self._empty_registry(client_id)
 
     def _read_for_update(self, client_id: str) -> dict:
@@ -222,7 +229,7 @@ class SessionRegistryManager:
         all updates go through the targeted mutation methods.
         """
         registry = self._empty_registry(client_id)
-        client_dir = self.profile_manager.get_sessions_root() / f"CLIENT_{client_id}"
+        client_dir = self.profile_manager.store.local_path(f"Sessions/CLIENT_{client_id}")
 
         if not client_dir.exists():
             logger.warning(f"Client directory not found: {client_dir}")
@@ -745,7 +752,7 @@ class SessionRegistryManager:
         """
         registry = self.read_registry(client_id)  # snapshot, only to decide what to re-read
         found = self._empty_registry(client_id)  # what the scan turns up; merged under the lock
-        client_dir = self.profile_manager.get_sessions_root() / f"CLIENT_{client_id}"
+        client_dir = self.profile_manager.store.local_path(f"Sessions/CLIENT_{client_id}")
         if not client_dir.exists():
             return 0
 

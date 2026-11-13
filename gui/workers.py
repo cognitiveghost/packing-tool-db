@@ -122,9 +122,8 @@ class RegistryRefreshWorker(QThread):
 
     def run(self) -> None:
         try:
-            # read_registry answers an unreachable server with an empty
-            # registry. Listing the server's root first lets the real error
-            # out, so the page can say the refresh failed (frame 7f).
+            # Listing the server's root first lets an unreachable server's own
+            # error out, so the page can say the refresh failed (frame 7f).
             os.listdir(self._registry.profile_manager.base_path)
             self._registry.ensure_registry(self._client_id)
             self._registry.refresh_available_lists(self._client_id)
@@ -142,14 +141,15 @@ class SessionDetailsWorker(QThread):
     loaded = Signal(str, object)  # (key, details)
     failed = Signal(str, str, str)  # (key, path, cause)
 
-    def __init__(self, key: str, entry: dict, parent=None):
+    def __init__(self, key: str, entry: dict, store, parent=None):
         super().__init__(parent)
         self._key = key
         self._entry = dict(entry)
+        self._store = store
 
     def run(self) -> None:
         try:
-            details = load_session_details(self._entry)
+            details = load_session_details(self._entry, self._store)
         except SessionFilesError as error:
             self.failed.emit(self._key, error.path, error.cause)
         except Exception:

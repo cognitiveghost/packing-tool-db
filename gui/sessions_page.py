@@ -382,7 +382,9 @@ class SessionsPage(QObject):
             self._details = None
             self._detail_error = None
         self._push_details()
-        worker = SessionDetailsWorker(self._detail_key, self._detail_entry, parent=self)
+        worker = SessionDetailsWorker(
+            self._detail_key, self._detail_entry, self._registry.profile_manager.store, parent=self
+        )
         worker.loaded.connect(self._on_details)
         worker.failed.connect(self._on_details_failed)
         worker.finished.connect(self._on_worker_finished)

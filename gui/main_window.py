@@ -2291,7 +2291,9 @@ class MainWindow(QMainWindow):
 
         # Create SessionManager for this client if not exists
         if not self.session_manager or self.session_manager.client_id != client_id:
-            self.session_manager = SessionManager(client_id=client_id)
+            self.session_manager = SessionManager(
+                client_id=client_id, store=self.profile_manager.store
+            )
 
         if work_dir is None:
             try:
