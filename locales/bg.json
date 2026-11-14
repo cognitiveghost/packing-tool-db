@@ -14,6 +14,7 @@
   "All orders packed": "Всички поръчки са опаковани",
   "All packed": "Всички опаковани",
   "Another PC": "Друг компютър",
+  "Another PC took this list while you were offline. Your progress is saved as {file}.": "Друг компютър взе този списък, докато бяхте офлайн. Напредъкът ви е запазен като {file}.",
   "Auto-refresh (2 min)": "Автообновяване (2 мин.)",
   "Average per item": "Средно на артикул",
   "Average per order": "Средно на поръчка",
@@ -341,6 +342,7 @@
   "The work folder for {list_name} could not be made: {detail}.": "Работната папка за {list_name} не можа да се създаде: {detail}.",
   "There’s already a worker called {name}. Pick that card, or add a surname.": "Вече има работник на име {name}. Изберете тази карта или добавете фамилно име.",
   "This PC has stopped packing it so the two don't overwrite each other's progress. Orders packed here up to now are saved.": "Този компютър спря опаковането, за да не се презаписват взаимно напредъкът на двата. Поръчките, опаковани тук досега, са запазени.",
+  "This PC has unsynced progress for {list_name} and the database is unreachable. Reconnect and start the app again to sync it.": "Този компютър има несинхронизиран напредък за {list_name}, а базата данни не е достъпна. Свържете се отново и стартирайте приложението, за да го синхронизирате.",
   "This barcode already maps to": "Този баркод вече е свързан със",
   "This barcode already maps to {sku}.": "Този баркод вече е свързан с {sku}.",
   "This list is open on another PC": "Списъкът е отворен на друг компютър",
@@ -368,6 +370,7 @@
   "Worker": "Работник",
   "Worker name": "Име на работник",
   "Working · step {step} of 3": "Работи се · стъпка {step} от 3",
+  "You are offline. Finish the open list before starting another.": "Нямате връзка. Завършете отворения списък, преди да започнете друг.",
   "Your {n} change is still here and nothing on the server changed.": [
     "Вашата {n} промяна е още тук и нищо на сървъра не се е променило.",
     "Вашите {n} промени са още тук и нищо на сървъра не се е променило."

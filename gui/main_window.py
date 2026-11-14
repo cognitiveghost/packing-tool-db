@@ -1,5 +1,6 @@
 import json
 import os
+import socket
 import sys
 import threading
 from pathlib import Path
@@ -24,7 +25,7 @@ from datetime import datetime
 
 import pandas as pd
 from openpyxl.styles import PatternFill
-from PySide6.QtCore import QEventLoop, QSettings, Qt, QTimer, Signal
+from PySide6.QtCore import QEventLoop, QSettings, QStandardPaths, Qt, QTimer, Signal
 from PySide6.QtGui import QCloseEvent, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
@@ -56,6 +57,7 @@ from gui.setup_payload import order_choices, quick_payload
 from gui.theme import apply_theme, current_tokens
 from gui.workers import SessionEndWorker, SessionStartWorker
 from packing_tool import APP_NAME, __version__
+from packing_tool.offline_buffer import BufferedStore
 from packing_tool.profile_manager import (
     NetworkError,
     ProfileManager,
@@ -82,6 +84,7 @@ from shared.server_connection import (
 from shared.session_id import derive_session_id
 from shared.stats_manager import StatsManager
 from shared.store_mode import Mode, open_store
+from shared.store_supabase import SupabaseStore
 from shared.theme import (
     theme_notifier,
     themed_tokens,
@@ -153,6 +156,11 @@ def _under_pytest() -> bool:
     return "pytest" in sys.modules
 
 
+def _offline_buffer_dir() -> Path:
+    base = QStandardPaths.writableLocation(QStandardPaths.AppLocalDataLocation)
+    return Path(base) / "PackingTool-DB" / "buffer"
+
+
 def _use_file_store() -> bool:
     """The file share only (no Supabase sign-in): FULFILLMENT_STORE_MODE=file, or a test run."""
     return os.environ.get("FULFILLMENT_STORE_MODE", "").strip().lower() == "file" or _under_pytest()
@@ -177,6 +185,7 @@ class MainWindow(QMainWindow):
 
     # A background heartbeat found another PC holding the lock (its work_dir)
     _heartbeat_lost = Signal(str)
+    _offline_conflict = Signal(str)  # conflict-copy path, from the heartbeat thread
     # Emitted from the connection-check thread; queued to the UI thread.
     _connection_checked = Signal(bool)
 
@@ -237,6 +246,7 @@ class MainWindow(QMainWindow):
         self._last_start = None
         self._starting = False  # see start_shopify_packing_session()
         self._heartbeat_lost.connect(self._on_heartbeat_lost)
+        self._offline_conflict.connect(self._on_offline_conflict)
         # ok / checking / down (spec 2026-10-08 section 6.5). Checked on Retry
         # and after a failed session action, never on a timer (owner decision).
         self._connection_state = "ok"
@@ -973,6 +983,11 @@ class MainWindow(QMainWindow):
             try:
                 if self._renew_lock(work_dir):
                     self._heartbeat_lost.emit(str(work_dir))  # queued to the UI thread
+                store = self.profile_manager.store
+                if isinstance(store, BufferedStore) and not store.online:
+                    res = store.flush()
+                    if res.conflict_rel:
+                        self._offline_conflict.emit(res.conflict_rel)
             finally:
                 self._heartbeat_busy = False
 
@@ -995,15 +1010,57 @@ class MainWindow(QMainWindow):
             fallback_root = resolve_file_server_path(ProfileManager._load_config(config_path))
         except ProfileManagerError:
             fallback_root = ""  # no share configured: the database alone can still serve this PC
+        buffer_dir = _offline_buffer_dir()
+        pending = BufferedStore.pending(buffer_dir)
         mode, store = open_store(
             "PackingTool-DB",
             fallback_root=fallback_root,
             cache_dir=Path(os.path.expanduser("~")) / ".packers_assistant" / "db_cache",
             prompt=lambda: SignInDialog.ask(self),
+            outbox_pending=pending is not None,
         )
         if mode is Mode.SUPABASE:
+            if pending:
+                self._flush_pending_outbox(store, buffer_dir, pending)
             return ProfileManager(config_path, store=store)
+        if mode is Mode.OFFLINE_BUFFER:
+            # Never the file share: that progress belongs to the database. Reconnect to sync it.
+            raise ProfileManagerError(
+                _(
+                    "This PC has unsynced progress for {list_name} and the database is "
+                    "unreachable. Reconnect and start the app again to sync it.",
+                    list_name=pending.rsplit("/", 1)[-1],
+                )
+            )
         return ProfileManager(config_path)
+
+    def _flush_pending_outbox(self, store, buffer_dir: Path, list_dir: str):
+        res = BufferedStore(store, buffer_dir, list_dir=list_dir, pc=socket.gethostname()).flush()
+        if res.conflict_rel:
+            self._startup_conflict = res.conflict_rel
+            logger.error(f"Offline progress conflicted with another PC; saved as {res.conflict_rel}")
+
+    def _on_offline_conflict(self, rel: str):
+        self._toast(
+            _("Another PC took this list while you were offline. Your progress is saved as {file}.", file=rel),
+            role="error",
+        )
+
+    def _wrap_store_for_list(self, work_dir: Path):
+        """Packing a list on the database: buffer its writes while the network is down."""
+        self._unwrap_store()  # a list that failed to open may have left a wrapper for another list
+        pm = self.profile_manager
+        if not isinstance(pm.store, SupabaseStore):
+            return
+        list_dir = Path(work_dir).relative_to(pm.store.local_path("")).as_posix()
+        pm.store = BufferedStore(
+            pm.store, _offline_buffer_dir(), list_dir=list_dir, pc=socket.gethostname()
+        )
+
+    def _unwrap_store(self):
+        pm = self.profile_manager
+        if isinstance(pm.store, BufferedStore):
+            pm.store = pm.store.inner
 
     def _renew_lock(self, work_dir: Path) -> bool:
         """Renew the session lock. True when another PC has taken it (spec B3)."""
@@ -1294,6 +1351,7 @@ class MainWindow(QMainWindow):
                 raise RuntimeError(error_msg)
 
             logger.info(f"Lock acquired on {work_dir}")
+            self._wrap_store_for_list(work_dir)
 
             # 4. Start heartbeat timer
             self._start_heartbeat_timer()
@@ -1745,6 +1803,7 @@ class MainWindow(QMainWindow):
         if self.logic:
             self.logic.end_session_cleanup()
             self.logic = None
+        self._unwrap_store()
 
         # Clear Shopify session variables
         if hasattr(self, "current_work_dir"):
@@ -2273,6 +2332,10 @@ class MainWindow(QMainWindow):
         (the "start packing" case); otherwise the existing work_dir is reused (resume).
         take_over is the stale lock the packer agreed to take over, or None.
         """
+        buffered = self.profile_manager.store
+        if isinstance(buffered, BufferedStore) and not buffered.online:
+            self._toast(_("You are offline. Finish the open list before starting another."), role="error")
+            return
         if self._starting:
             return
         if self._connection_state == "down":
