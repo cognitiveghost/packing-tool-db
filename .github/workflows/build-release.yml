@@ -56,6 +56,8 @@ jobs:
           repository: cognitiveghost/shopify-fulfillment-tool-db
           ref: ${{ steps.pin.outputs.sha }}
           path: fulfilment-ref
+          # shopify-fulfillment-tool-db is private: GITHUB_TOKEN cannot read it.
+          token: ${{ secrets.FULFILMENT_DB_READ_TOKEN }}
           persist-credentials: false
       - name: Set up Supabase CLI
         uses: supabase/setup-cli@v1
@@ -68,7 +70,7 @@ jobs:
           supabase status --workdir fulfilment-ref -o env | sed -e 's/^API_URL=/SUPABASE_TEST_URL=/' -e 's/^ANON_KEY=/SUPABASE_TEST_ANON_KEY=/' -e 's/^SERVICE_ROLE_KEY=/SUPABASE_TEST_SERVICE_KEY=/' | tr -d '"' | grep '^SUPABASE_TEST_' >> "$GITHUB_ENV"
       - name: Lint (ruff)
         # shared/ is a synced copy of shopify-fulfillment-tool's; it is linted there.
-        run: ruff check . --exclude shared
+        run: ruff check . --exclude shared --exclude fulfilment-ref
       - name: Import main module
         run: python -c "import main"
       - name: Run tests
@@ -101,6 +103,8 @@ jobs:
           repository: cognitiveghost/shopify-fulfillment-tool-db
           ref: ${{ steps.pin.outputs.sha }}
           path: fulfilment-ref
+          # shopify-fulfillment-tool-db is private: GITHUB_TOKEN cannot read it.
+          token: ${{ secrets.FULFILMENT_DB_READ_TOKEN }}
           persist-credentials: false
       - name: Diff shared/ against the canonical copy
         run: |

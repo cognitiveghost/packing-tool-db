@@ -181,7 +181,7 @@ class MainWindow(QMainWindow):
                 Use a dev config (e.g. config.dev.ini) to point at a local mock server.
         """
         super().__init__()
-        self.setWindowTitle(" ".join((APP_NAME, __version__)) + _DB_TRIAL)
+        self.setWindowTitle(" ".join((APP_NAME, __version__ + _DB_TRIAL)))
 
         from shared.theme import restore_window_geometry
 

@@ -472,11 +472,17 @@ def test_the_question_says_who_had_it_and_what_comes_along():
 
 
 def test_the_question_drops_the_words_it_has_nothing_for():
-    made = takeover_payload(entry(pc_name=""), {"locked_by": "", "worker_name": None,
+    made = takeover_payload(entry(pc_name="", worker_name=None), {"locked_by": "", "worker_name": None,
                                                 "heartbeat": ""}, now=NOW)
     assert made["body"] == (
         "Another PC stopped responding. If it comes back, it is told the session moved here."
     )
+
+
+
+def test_a_store_lock_without_a_worker_names_the_registry_worker():
+    made = takeover_payload(entry(), {"locked_by": "WH-PC-02", "heartbeat": ""}, now=NOW)
+    assert "while Maria was packing" in made["body"]
 
 
 # --- the list export (section 8) ----------------------------------------------------
