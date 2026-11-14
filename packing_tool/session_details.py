@@ -13,6 +13,7 @@ from datetime import datetime
 from pathlib import Path
 
 from packing_tool.packer_logic import compute_order_timing_metrics
+from shared.store import Store, StoreError, StoreNotFound
 
 logger = logging.getLogger(__name__)
 
@@ -38,20 +39,20 @@ def error_cause(error: Exception) -> str:
     return (text[:1].lower() + text[1:]).rstrip(".")
 
 
-def _read(path: Path, *, required: bool) -> dict:
-    """The file's dict; {} when it is absent.
+def _read(store: Store, path: Path, *, required: bool) -> dict:
+    """The file's dict; {} when it is absent. path is the absolute file, for messages.
 
-    json.load, not the JSON cache: a refresh must see the file as it is now.
+    Read through the store, not the JSON cache: a refresh must see the file as it is now.
     """
     try:
-        with open(path, encoding="utf-8") as handle:
-            data = json.load(handle)
-    except FileNotFoundError:
+        data = store.read_json(path.relative_to(store.local_path("")).as_posix())
+    except StoreNotFound:
         return {}
-    except (OSError, ValueError) as error:  # json.JSONDecodeError is a ValueError
+    except StoreError as error:  # the OS or JSON error is the cause
+        cause = error.__cause__ or error
         if required:
-            raise SessionFilesError(path, error_cause(error)) from error
-        logger.warning("Could not read %s: %s", path, error)
+            raise SessionFilesError(path, error_cause(cause)) from cause
+        logger.warning("Could not read %s: %s", path, cause)
         return {}
     return data if isinstance(data, dict) else {}
 
@@ -134,7 +135,7 @@ def partial_summary(packing_state: dict, session_info: dict) -> dict:
     }
 
 
-def load_session_details(entry: dict) -> dict:
+def load_session_details(entry: dict, store: Store) -> dict:
     """{'record', 'packing_state', 'session_info', 'session_summary'} for a registry entry.
 
     Raises SessionFilesError when the summary or the state file exists and
@@ -146,9 +147,9 @@ def load_session_details(entry: dict) -> dict:
         raise SessionFilesError(session_id, "it has no work folder")
     work = Path(work_dir)
 
-    summary = _read(work / "session_summary.json", required=True)
-    state = _read(work / "packing_state.json", required=True)
-    info = _read(work.parent / "session_info.json", required=False)
+    summary = _read(store, work / "session_summary.json", required=True)
+    state = _read(store, work / "packing_state.json", required=True)
+    info = _read(store, work.parent / "session_info.json", required=False)
     if not summary and not state:
         raise SessionFilesError(work, "it holds no session files")
 

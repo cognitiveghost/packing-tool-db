@@ -8,6 +8,7 @@ import pytest
 from packing_tool.session_lock_manager import SessionLockManager
 from packing_tool.session_registry_manager import SessionRegistryManager
 from shared.metadata_utils import get_current_timestamp
+from shared.store import StoreError
 
 
 @pytest.fixture
@@ -15,8 +16,9 @@ def registry(profile_manager):
     return SessionRegistryManager(profile_manager)
 
 
-def _entry(tmp_path, **over):
-    session_path = tmp_path / "2026-09-24_1"
+def _entry(profile_manager, **over):
+    """A started entry whose work folder sits under the store root (the lock is read through the Store)."""
+    session_path = profile_manager.store.local_path("Sessions/CLIENT_M/2026-09-24_1")
     work_dir = session_path / "packing" / "DHL_Orders"
     work_dir.mkdir(parents=True, exist_ok=True)
     entry = {"status": "in_progress", "last_updated": get_current_timestamp(),
@@ -31,30 +33,30 @@ def _lock(work_dir, age_seconds):
         json.dumps({"locked_by": "PC-1", "heartbeat": beat}), encoding="utf-8")
 
 
-def test_a_live_session_reads_in_progress_from_its_work_dir_lock(registry, tmp_path):
-    entry, work_dir = _entry(tmp_path)
+def test_a_live_session_reads_in_progress_from_its_work_dir_lock(registry, profile_manager):
+    entry, work_dir = _entry(profile_manager)
     _lock(work_dir, age_seconds=10)
     assert registry._resolve_status(entry) == "in_progress"
 
 
-def test_a_silent_lock_reads_stale(registry, tmp_path):
-    entry, work_dir = _entry(tmp_path)
+def test_a_silent_lock_reads_stale(registry, profile_manager):
+    entry, work_dir = _entry(profile_manager)
     _lock(work_dir, age_seconds=600)
     assert registry._resolve_status(entry) == "stale"
 
 
-def test_stale_in_the_list_means_the_lock_can_be_taken(registry, tmp_path):
+def test_stale_in_the_list_means_the_lock_can_be_taken(registry, profile_manager):
     """One threshold, the lock's: a row reads Stale exactly when Resume can
     take the session over (spec 2026-10-08 phase 4, section 5.5)."""
-    entry, work_dir = _entry(tmp_path)
+    entry, work_dir = _entry(profile_manager)
     _lock(work_dir, age_seconds=SessionLockManager.STALE_TIMEOUT + 10)
     assert registry._resolve_status(entry) == "stale"
     _lock(work_dir, age_seconds=SessionLockManager.STALE_TIMEOUT - 30)
     assert registry._resolve_status(entry) == "in_progress"
 
 
-def test_no_lock_reads_paused(registry, tmp_path):
-    entry, _work_dir = _entry(tmp_path)
+def test_no_lock_reads_paused(registry, profile_manager):
+    entry, _work_dir = _entry(profile_manager)
     assert registry._resolve_status(entry) == "paused"
 
 
@@ -308,3 +310,51 @@ def test_an_unreadable_rewrite_keeps_the_old_entry(registry, profile_manager):
     registry.refresh_available_lists("M")
     [entry] = registry.get_available_lists("M")
     assert entry["total_orders"] == 16
+
+
+def _fail_listing(monkeypatch, store, folder_rel):
+    """Make store.list_dir fail for one folder, as a dropped share would."""
+    real = store.list_dir
+
+    def list_dir(rel):
+        if rel == folder_rel:
+            raise StoreError(rel)
+        return real(rel)
+
+    monkeypatch.setattr(store, "list_dir", list_dir)
+
+
+def test_a_packing_lists_folder_that_cannot_be_listed_withdraws_nothing(registry, profile_manager, monkeypatch):
+    """A failed listing is not an empty folder: the lists in it are kept, not withdrawn."""
+    _session_tree(profile_manager, "2026-10-01_1", ["L"])
+    registry.refresh_available_lists("M")
+    [before] = registry.get_available_lists("M")
+    _fail_listing(monkeypatch, profile_manager.store, "Sessions/CLIENT_M/2026-10-01_1/packing_lists")
+    assert registry.refresh_available_lists("M") == 0
+    assert registry.get_available_lists("M") == [before]
+
+
+def test_a_client_folder_that_cannot_be_listed_withdraws_nothing(registry, profile_manager, monkeypatch):
+    _session_tree(profile_manager, "2026-10-01_1", ["L"])
+    registry.refresh_available_lists("M")
+    [before] = registry.get_available_lists("M")
+    _fail_listing(monkeypatch, profile_manager.store, "Sessions/CLIENT_M")
+    assert registry.refresh_available_lists("M") == 0
+    assert registry.get_available_lists("M") == [before]
+
+
+def test_a_registry_that_is_not_there_reads_empty(registry):
+    assert registry.read_registry("M")["sessions"] == {}
+
+
+@pytest.mark.parametrize("damage", ["corrupt", "directory"])
+def test_a_registry_that_cannot_be_read_raises_rather_than_reading_empty(registry, profile_manager, damage):
+    """An empty answer during an outage read as "no sessions yet" and was written back over the real list."""
+    path = profile_manager.store.local_path("Sessions/CLIENT_M/registry_index.json")
+    path.parent.mkdir(parents=True)
+    if damage == "corrupt":
+        path.write_text("{", encoding="utf-8")
+    else:
+        path.mkdir()
+    with pytest.raises(StoreError):
+        registry.read_registry("M")

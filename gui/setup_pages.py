@@ -192,8 +192,7 @@ class SetupPages(QWidget):
         self.bridge.leaveAsked.emit()
 
     def _mapping_path(self) -> str:
-        folder = self._profile_manager.clients_dir / f"CLIENT_{self._client}"
-        return str(folder / "packer_config.json")
+        return str(self._profile_manager.store.local_path(f"Clients/CLIENT_{self._client}/packer_config.json"))
 
     def _load_mapping(self) -> None:
         # ponytail: read on the UI thread, as the dialog did; one small file.

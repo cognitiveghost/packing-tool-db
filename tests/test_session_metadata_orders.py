@@ -1,10 +1,12 @@
 import json
 
 from packing_tool.session_manager import SessionManager
+from shared.store import FileStore
 
 
-def _mgr():
-    return SessionManager(client_id="ALMADERM")
+def _mgr(session_dir):
+    """A manager whose store is the server root holding the session folder."""
+    return SessionManager(client_id="ALMADERM", store=FileStore(session_dir.parent))
 
 
 def _seed_session_info(tmp_path):
@@ -21,7 +23,7 @@ def _read(tmp_path):
 def test_completed_orders_are_recorded(tmp_path):
     _seed_session_info(tmp_path)
 
-    _mgr().update_session_metadata(
+    _mgr(tmp_path).update_session_metadata(
         str(tmp_path), "ALL_ORDERS", "completed",
         completed_orders=["#11019512", "#11019513"],
     )
@@ -35,7 +37,7 @@ def test_call_without_orders_still_works(tmp_path):
     """Pre-existing three-argument callers must keep working."""
     _seed_session_info(tmp_path)
 
-    _mgr().update_session_metadata(str(tmp_path), "ALL_ORDERS", "in_progress")
+    _mgr(tmp_path).update_session_metadata(str(tmp_path), "ALL_ORDERS", "in_progress")
 
     block = _read(tmp_path)["packing_progress"]["ALL_ORDERS"]
     assert block["status"] == "in_progress"
@@ -45,7 +47,7 @@ def test_call_without_orders_still_works(tmp_path):
 def test_orders_are_merged_not_replaced_across_calls(tmp_path):
     """A resumed session must not lose orders packed before the resume."""
     _seed_session_info(tmp_path)
-    mgr = _mgr()
+    mgr = _mgr(tmp_path)
 
     mgr.update_session_metadata(
         str(tmp_path), "ALL_ORDERS", "completed", completed_orders=["#A"]
@@ -61,7 +63,7 @@ def test_orders_are_merged_not_replaced_across_calls(tmp_path):
 def test_other_keys_in_session_info_are_preserved(tmp_path):
     _seed_session_info(tmp_path)
 
-    _mgr().update_session_metadata(
+    _mgr(tmp_path).update_session_metadata(
         str(tmp_path), "ALL_ORDERS", "completed", completed_orders=["#A"]
     )
 
@@ -71,7 +73,7 @@ def test_other_keys_in_session_info_are_preserved(tmp_path):
 
 
 def test_missing_session_info_does_not_raise(tmp_path):
-    _mgr().update_session_metadata(
+    _mgr(tmp_path).update_session_metadata(
         str(tmp_path), "ALL_ORDERS", "completed", completed_orders=["#A"]
     )
     assert not (tmp_path / "session_info.json").exists()
@@ -81,14 +83,15 @@ def test_write_happens_inside_the_sidecar_lock(tmp_path, monkeypatch):
     """The Shopify tool guards this same file with an exclusive lock on the
     sidecar .lock. Without taking it here, its read-modify-write and ours
     interleave and one side's order numbers are silently lost. This pins both
-    that the lock is taken and that the write happens inside it."""
+    that the lock is taken and that the write happens inside it. The lock and
+    the write are the Store's (update_json), so the spies sit in shared.store."""
     import contextlib
 
-    import packing_tool.session_manager as sm
+    import shared.store as store_mod
 
     events = []
-    real_locked_file = sm.locked_file
-    real_atomic_write = sm.atomic_write_json
+    real_locked_file = store_mod.locked_file
+    real_atomic_write = store_mod.atomic_write_json
 
     @contextlib.contextmanager
     def spy_locked_file(handle, *args, **kwargs):
@@ -101,11 +104,11 @@ def test_write_happens_inside_the_sidecar_lock(tmp_path, monkeypatch):
         events.append(("write", str(path)))
         return real_atomic_write(path, *args, **kwargs)
 
-    monkeypatch.setattr(sm, "locked_file", spy_locked_file)
-    monkeypatch.setattr(sm, "atomic_write_json", spy_atomic_write)
+    monkeypatch.setattr(store_mod, "locked_file", spy_locked_file)
+    monkeypatch.setattr(store_mod, "atomic_write_json", spy_atomic_write)
 
     _seed_session_info(tmp_path)
-    _mgr().update_session_metadata(
+    _mgr(tmp_path).update_session_metadata(
         str(tmp_path), "ALL_ORDERS", "completed", completed_orders=["#1"]
     )
 
@@ -119,11 +122,11 @@ def test_lock_guards_the_read_too_not_just_the_write(tmp_path, monkeypatch):
     read the same snapshot first. Pin that the read is inside the lock."""
     import contextlib
 
-    import packing_tool.session_manager as sm
+    import shared.store as store_mod
 
     events = []
-    real_locked_file = sm.locked_file
-    real_open = open
+    real_locked_file = store_mod.locked_file
+    real_read_json = store_mod.FileStore.read_json
 
     @contextlib.contextmanager
     def spy_locked_file(handle, *args, **kwargs):
@@ -132,16 +135,16 @@ def test_lock_guards_the_read_too_not_just_the_write(tmp_path, monkeypatch):
             yield
         events.append("lock_released")
 
-    def spy_open(path, *args, **kwargs):
-        if str(path).endswith("session_info.json"):
+    def spy_read_json(self, rel):
+        if rel.endswith("session_info.json"):
             events.append("read")
-        return real_open(path, *args, **kwargs)
+        return real_read_json(self, rel)
 
-    monkeypatch.setattr(sm, "locked_file", spy_locked_file)
-    monkeypatch.setattr("builtins.open", spy_open)
+    monkeypatch.setattr(store_mod, "locked_file", spy_locked_file)
+    monkeypatch.setattr(store_mod.FileStore, "read_json", spy_read_json)
 
     _seed_session_info(tmp_path)
-    _mgr().update_session_metadata(
+    _mgr(tmp_path).update_session_metadata(
         str(tmp_path), "ALL_ORDERS", "completed", completed_orders=["#1"]
     )
 

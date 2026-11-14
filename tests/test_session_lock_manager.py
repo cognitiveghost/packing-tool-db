@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 import pytest
 
 from packing_tool.session_lock_manager import SessionLockManager
+from shared.store import StoreError
 
 
 @pytest.fixture
@@ -52,7 +53,6 @@ def test_acquire_lock_creates_lock_file(lock_manager, session_dir):
     data = json.loads(lock_path.read_text(encoding="utf-8"))
     assert data["locked_by"] == lock_manager.hostname
     assert data["process_id"] == lock_manager.process_id
-    assert data["worker_id"] == "w1"
 
 
 def test_reacquiring_own_lock_succeeds_and_updates_heartbeat(lock_manager, session_dir):
@@ -186,8 +186,10 @@ def test_same_pc_different_process_is_treated_as_a_foreign_lock_until_stale(lock
 @pytest.fixture
 def no_retry_delay(monkeypatch):
     import packing_tool.session_lock_manager as slm
+    import shared.store as store_mod
 
     monkeypatch.setattr(slm, "LOCK_READ_RETRY_SECONDS", 0)
+    monkeypatch.setattr(store_mod, "LOCK_READ_RETRY_SECONDS", 0)
 
 
 def test_an_unreadable_lock_counts_as_held_and_is_left_alone(lock_manager, session_dir, no_retry_delay):
@@ -215,12 +217,12 @@ def test_losing_the_creation_race_is_refused_not_overwritten(lock_manager, sessi
 
 
 def test_the_heartbeat_rewrites_the_lock_atomically(lock_manager, session_dir, monkeypatch):
-    import packing_tool.session_lock_manager as slm
+    import shared.store as store_mod
 
     assert lock_manager.acquire_lock("M", session_dir)[0]
     writes = []
-    real = slm.atomic_write_json
-    monkeypatch.setattr(slm, "atomic_write_json", lambda p, d, **kw: (writes.append(p), real(p, d, **kw)))
+    real = store_mod.atomic_write_json
+    monkeypatch.setattr(store_mod, "atomic_write_json", lambda p, d, **kw: (writes.append(p), real(p, d, **kw)))
 
     assert lock_manager.update_heartbeat(session_dir) is True
     assert writes == [session_dir / SessionLockManager.LOCK_FILENAME]
@@ -255,39 +257,45 @@ def test_an_unreadable_lock_nobody_renews_goes_stale_by_its_file_age(lock_manage
     assert lock_manager.acquire_lock("M", session_dir)[0]
 
 
-def test_a_lock_records_the_running_app_version():
-    """Lock files say which build held the session; it used to be a
-    hardcoded "1.3.0" whatever the release."""
-    from packing_tool import __version__
-    from packing_tool.session_lock_manager import SessionLockManager
-
-    assert SessionLockManager(None).app_version == __version__
-
-
 # ---------------------------------------------------------------------------
 # Error paths
 # ---------------------------------------------------------------------------
 
-def test_a_lock_missing_its_fields_is_released_as_safe(lock_manager, tmp_path):
-    (tmp_path / SessionLockManager.LOCK_FILENAME).write_text("{}", encoding="utf-8")
-    assert lock_manager.release_lock(tmp_path) is True
-    assert not (tmp_path / SessionLockManager.LOCK_FILENAME).exists()
+def test_a_lock_missing_its_fields_is_released_as_safe(lock_manager, session_dir):
+    (session_dir / SessionLockManager.LOCK_FILENAME).write_text("{}", encoding="utf-8")
+    assert lock_manager.release_lock(session_dir) is True
+    assert not (session_dir / SessionLockManager.LOCK_FILENAME).exists()
 
 
-def test_an_unreadable_lock_is_held_never_released(lock_manager, tmp_path, monkeypatch):
+def test_an_unreadable_lock_is_held_never_released(lock_manager, session_dir, monkeypatch):
     """A lock another PC is rewriting reads as broken for a moment: it is held, not free
     (Phase 12 Bundle 2, B1), so release leaves it alone."""
     monkeypatch.setattr("packing_tool.session_lock_manager.time.sleep", lambda _s: None)
-    lock = tmp_path / SessionLockManager.LOCK_FILENAME
+    lock = session_dir / SessionLockManager.LOCK_FILENAME
     lock.write_text("{not json", encoding="utf-8")
-    assert lock_manager.is_locked(tmp_path)[0] is True
-    assert lock_manager.release_lock(tmp_path) is False
+    assert lock_manager.is_locked(session_dir)[0] is True
+    assert lock_manager.release_lock(session_dir) is False
     assert lock.exists()
 
 
-def test_a_heartbeat_on_a_folder_that_vanished_reports_failure(lock_manager, tmp_path, monkeypatch):
-    work_dir = tmp_path / "work"
-    work_dir.mkdir()
+def test_a_store_read_failure_is_held_not_free(lock_manager, session_dir, monkeypatch, no_retry_delay):
+    """Any read failure from the Store (not only bad JSON) reads as held, never as no lock."""
+    _write_foreign_lock(session_dir, hostname="OTHER-PC", heartbeat_age_seconds=5)
+
+    def broken_read(rel):
+        raise StoreError(rel)
+
+    monkeypatch.setattr(lock_manager.store, "read_json", broken_read)
+    locked, info = lock_manager.is_locked(session_dir)
+    assert locked is True
+    assert info["unreadable"] is True
+    assert lock_manager.owns_lock(session_dir) is None
+    assert lock_manager.release_lock(session_dir) is False
+
+
+def test_a_heartbeat_on_a_folder_that_vanished_reports_failure(lock_manager, server_root, monkeypatch):
+    work_dir = server_root / "Sessions" / "CLIENT_M" / "work"
+    work_dir.mkdir(parents=True)
     ok, msg, _ = lock_manager.acquire_lock("M", work_dir)
     assert ok, msg
     monkeypatch.setattr("packing_tool.session_lock_manager.time.sleep", lambda _s: None)
@@ -296,10 +304,40 @@ def test_a_heartbeat_on_a_folder_that_vanished_reports_failure(lock_manager, tmp
     assert lock_manager.update_heartbeat(work_dir) is False
 
 
-def test_force_releasing_an_invalid_lock_removes_it(lock_manager, tmp_path):
-    (tmp_path / SessionLockManager.LOCK_FILENAME).write_text("{}", encoding="utf-8")
-    assert lock_manager.force_release_lock(tmp_path) is True
-    assert not (tmp_path / SessionLockManager.LOCK_FILENAME).exists()
+def test_force_releasing_an_invalid_lock_removes_it(lock_manager, session_dir):
+    (session_dir / SessionLockManager.LOCK_FILENAME).write_text("{}", encoding="utf-8")
+    assert lock_manager.force_release_lock(session_dir) is True
+    assert not (session_dir / SessionLockManager.LOCK_FILENAME).exists()
+
+
+# ---------------------------------------------------------------------------
+# Store-backed rules: takeover, ownership by PC and process
+# ---------------------------------------------------------------------------
+
+def test_a_stale_lock_is_taken_over_only_when_it_is_still_the_one_asked_about(lock_manager, session_dir):
+    _write_foreign_lock(session_dir, hostname="OTHER-PC", heartbeat_age_seconds=200)
+    _ok, _msg, asked = lock_manager.acquire_lock("M", session_dir)
+    lock_path = session_dir / SessionLockManager.LOCK_FILENAME
+
+    # The question was open while the other PC came back: its heartbeat moved on.
+    _write_foreign_lock(session_dir, hostname="OTHER-PC", heartbeat_age_seconds=3)
+    assert lock_manager.force_release_lock(session_dir, expected=asked) is False
+    assert lock_manager.is_locked(session_dir)[1]["locked_by"] == "OTHER-PC"
+
+    # The lock as the user was shown it, still stale: now it is taken over.
+    lock_path.write_text(json.dumps(asked), encoding="utf-8")
+    assert lock_manager.force_release_lock(session_dir, expected=asked) is True
+    assert lock_manager.acquire_lock("M", session_dir)[0] is True
+    assert lock_manager.owns_lock(session_dir) is True
+
+
+def test_same_pc_but_another_process_is_not_ours(lock_manager, session_dir, monkeypatch):
+    monkeypatch.setattr(lock_manager, "hostname", "MY-PC")
+    _write_foreign_lock(session_dir, hostname="MY-PC", process_id=lock_manager.process_id + 1, heartbeat_age_seconds=5)
+
+    assert lock_manager.owns_lock(session_dir) is False
+    assert lock_manager.release_lock(session_dir) is False
+    assert (session_dir / SessionLockManager.LOCK_FILENAME).exists()
 
 
 def test_stale_minutes_of_an_unreadable_heartbeat_is_zero(lock_manager):

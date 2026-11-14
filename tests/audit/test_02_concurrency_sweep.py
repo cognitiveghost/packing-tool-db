@@ -17,6 +17,7 @@ from packing_tool.profile_manager import ProfileManager, ProfileManagerError
 from packing_tool.session_lock_manager import SessionLockManager
 from packing_tool.session_registry_manager import SessionRegistryManager
 from packing_tool.worker_manager import WorkerManager
+from shared.store import FileStore
 
 
 def _lock(work_dir: Path, by: str, age_seconds: int, pid: int = 1):
@@ -37,8 +38,8 @@ def _lock_owner(work_dir: Path) -> str:
 # ---------------------------------------------------------------------------
 
 
-def test_two_pcs_racing_for_a_free_list_get_one_lock(profile_manager, tmp_path):
-    work_dir = tmp_path / "L"
+def test_two_pcs_racing_for_a_free_list_get_one_lock(profile_manager):
+    work_dir = profile_manager.store.local_path("L")
     work_dir.mkdir()
     pc1, pc2 = SessionLockManager(profile_manager), SessionLockManager(profile_manager)
     pc2.hostname = "PC-2"
@@ -59,7 +60,7 @@ def test_registry_writers_do_not_drop_each_others_entries(profile_manager):
 
 
 def test_a_take_over_does_not_steal_a_lock_that_changed_meanwhile(main_window, tmp_path):
-    work_dir = tmp_path / "L"
+    work_dir = main_window.profile_manager.store.local_path("L")
     work_dir.mkdir()
     _lock(work_dir, "PC-OLD", age_seconds=600)  # stale: its PC crashed
     lock_file = work_dir / SessionLockManager.LOCK_FILENAME
@@ -134,19 +135,20 @@ def test_an_unreadable_mapping_file_is_not_saved_over(config_ini, monkeypatch):
 
 
 def test_two_pcs_ending_sessions_together_both_count(server_root):
-    pc1, pc2 = WorkerManager(str(server_root)), WorkerManager(str(server_root))
+    pc1, pc2 = WorkerManager(FileStore(server_root)), WorkerManager(FileStore(server_root))
     worker = pc1.create_worker("Ana")
 
     loaded, release = threading.Event(), threading.Event()
-    plain_load = pc1._load_workers_registry
+    plain_read = pc1.store.read_json
 
-    def slow_load():
-        data = plain_load()
+    def slow_read(rel):
+        data = plain_read(rel)
         loaded.set()
         release.wait(2)
         return data
 
-    pc1._load_workers_registry = slow_load
+    # update_json reads the registry under its lock; hold that read open
+    pc1.store.read_json = slow_read
     first = threading.Thread(target=lambda: pc1.update_worker_stats(worker.id, orders=3))
     first.start()
     loaded.wait(2)
@@ -217,7 +219,7 @@ def test_the_client_cannot_change_under_a_running_list(main_window_with_list, tm
 
 
 def test_the_heartbeat_runs_off_the_ui_thread_and_notices_a_takeover(main_window, tmp_path, monkeypatch, qtbot):
-    work_dir = tmp_path / "L"
+    work_dir = main_window.profile_manager.store.local_path("L")
     work_dir.mkdir()
     _lock(work_dir, "PC-2", age_seconds=0, pid=2)
     main_window.logic = Mock()
@@ -240,7 +242,7 @@ def test_the_heartbeat_runs_off_the_ui_thread_and_notices_a_takeover(main_window
 
 def test_a_release_waits_for_a_renewal_already_on_the_share(main_window, tmp_path, monkeypatch, qtbot):
     # A renewal that read the lock just before a release must not write it back afterwards.
-    work_dir = tmp_path / "L"
+    work_dir = main_window.profile_manager.store.local_path("L")
     work_dir.mkdir()
     main_window.logic = Mock()
     main_window.current_work_dir = str(work_dir)

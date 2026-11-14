@@ -452,7 +452,8 @@ def takeover_payload(entry: dict, lock: dict, now: datetime | None = None) -> di
     """Frame 7c: who had the session, since when, and what comes along."""
     now = _now(now)
     pc = lock.get("locked_by") or entry.get("pc_name") or _("Another PC")
-    worker = lock.get("worker_name") or ""
+    # Store locks carry no worker; the registry entry does.
+    worker = lock.get("worker_name") or entry.get("worker_name") or ""
     at = _at(lock.get("heartbeat"), now)
     done = _count(entry.get("completed_orders"))
     total = _count(entry.get("total_orders"))

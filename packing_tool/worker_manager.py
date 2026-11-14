@@ -7,14 +7,19 @@ Simple trust-based system without authentication.
 
 import json
 import logging
-from contextlib import contextmanager
 from dataclasses import asdict, dataclass
-from pathlib import Path
 
-from shared.atomic_write import atomic_write_json
-from shared.file_lock import locked_file
+from shared.store import Store, StoreError, StoreNotFound
 
 logger = logging.getLogger(__name__)
+
+REGISTRY = "Workers/workers.json"
+REGISTRY_BACKUP = "Workers/workers.json.backup"
+REGISTRY_VERSION = "1.3.0"
+
+
+class _NoSuchWorker(Exception):
+    """Raised inside an update to end it without writing the registry."""
 
 
 @dataclass
@@ -92,16 +97,14 @@ class WorkerManager:
         └── workers.json  (registry of all workers)
     """
 
-    def __init__(self, base_path: str):
+    def __init__(self, store: Store):
         """Initialize WorkerManager
 
         Args:
-            base_path: Base path to warehouse fulfillment folder
-                      e.g., \\\\server\\...\\0UFulfilment
+            store: The server store; the registry is Workers/workers.json in it
         """
-        self.base_path = Path(base_path)
-        self.workers_dir = self.base_path / "Workers"
-        self.workers_file = self.workers_dir / "workers.json"
+        self.store = store
+        self.workers_dir = store.local_path("Workers")  # display only
 
         # Create directory if doesn't exist
         self._ensure_workers_directory()
@@ -111,21 +114,22 @@ class WorkerManager:
     def _ensure_workers_directory(self):
         """Create Workers directory if doesn't exist"""
         try:
-            self.workers_dir.mkdir(parents=True, exist_ok=True)
+            self.store.claim_dir("Workers")
             logger.debug(f"Workers directory ready: {self.workers_dir}")
         except Exception:
             logger.exception("Failed to create Workers directory")
             raise
 
-    @contextmanager
-    def _locked(self):
-        """Hold workers.json's sidecar lock for one read-modify-write.
+    @staticmethod
+    def _corrupt(e: StoreError) -> bool:
+        """Invalid JSON in the registry, as opposed to the server being unavailable."""
+        return isinstance(e.__cause__, json.JSONDecodeError)
 
-        Every PC's End session adds to this one file; unlocked, two at once
-        kept only the last writer's counts (AUDIT-02-4).
-        """
-        with open(self.workers_file.with_name("workers.json.lock"), "a+") as handle, locked_file(handle):
-            yield
+    def _back_up_corrupt(self):
+        """Move a corrupt registry aside, as reads always have."""
+        if self.store.exists(REGISTRY):
+            self.store.move(REGISTRY, REGISTRY_BACKUP)
+        logger.warning(f"Corrupted file backed up to: {REGISTRY_BACKUP}")
 
     def _load_workers_registry(self) -> dict[str, list]:
         """Load workers.json registry
@@ -133,46 +137,45 @@ class WorkerManager:
         Returns:
             dict: {"workers": [list of worker dicts]}
         """
-        if not self.workers_file.exists():
+        try:
+            data = self.store.read_json(REGISTRY)
+        except StoreNotFound:
             # Initialize empty registry
             return {"workers": []}
-
-        try:
-            with open(self.workers_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-
-            logger.debug(f"Loaded {len(data.get('workers', []))} workers from registry")
-            return data
-
-        except json.JSONDecodeError:
+        except StoreError as e:
+            if not self._corrupt(e):
+                logger.exception("Failed to load workers registry")
+                raise
             logger.exception("Corrupted workers.json")
-            # Backup corrupted file
-            backup_path = self.workers_file.with_suffix('.json.backup')
-            self.workers_file.rename(backup_path)
-            logger.warning(f"Corrupted file backed up to: {backup_path}")
+            self._back_up_corrupt()
             return {"workers": []}
 
-        except Exception:
-            logger.exception("Failed to load workers registry")
-            raise
+        logger.debug(f"Loaded {len(data.get('workers', []))} workers from registry")
+        return data
 
-    def _save_workers_registry(self, data: dict[str, list]):
-        """Save workers.json registry with version
+    def _update_registry(self, change) -> dict:
+        """Read-modify-write workers.json under its lock; change(data) edits it in place.
 
-        Args:
-            data: {"workers": [list of worker dicts], "version": "1.3.0"}
+        Every PC's End session adds to this one file; unlocked, two at once
+        kept only the last writer's counts (AUDIT-02-4). A change that raises
+        writes nothing. A corrupt file is moved aside and the change starts from
+        an empty registry, as the read always did.
         """
+        def edit(current):
+            data = {"workers": []} if current is None else current
+            change(data)
+            data["version"] = REGISTRY_VERSION
+            return data
+
         try:
-            # Add version to root level
-            data['version'] = "1.3.0"
-
-            atomic_write_json(self.workers_file, data, indent=2, ensure_ascii=False)
-
-            logger.debug(f"Saved {len(data['workers'])} workers to registry (v1.3.0)")
-
-        except Exception:
-            logger.exception("Failed to save workers registry")
-            raise
+            return self.store.update_json(REGISTRY, edit)
+        except StoreError as e:
+            if not self._corrupt(e):
+                logger.exception("Failed to save workers registry")
+                raise
+            logger.exception("Corrupted workers.json")
+            self._back_up_corrupt()
+        return self.store.update_json(REGISTRY, edit)
 
     def get_all_workers(self) -> list[WorkerProfile]:
         """Get all worker profiles
@@ -223,14 +226,17 @@ class WorkerManager:
         name = name.strip()
         from shared.metadata_utils import get_current_timestamp
 
-        with self._locked():
-            data = self._load_workers_registry()
+        worker = None
+
+        def add(data):
+            nonlocal worker
             existing = [WorkerProfile.from_dict(w) for w in data.get('workers', [])]
             if any(w.name.lower() == name.lower() for w in existing):
                 raise ValueError(f"Worker with name '{name}' already exists")
             worker = self._new_worker(self._generate_worker_id(existing), name, get_current_timestamp())
             data.setdefault('workers', []).append(worker.to_dict())
-            self._save_workers_registry(data)
+
+        self._update_registry(add)
 
         logger.info(f"Created worker: {worker.id} ({name})")
         return worker
@@ -296,48 +302,45 @@ class WorkerManager:
         """
         from shared.metadata_utils import get_current_timestamp
 
-        with self._locked():
-            self._add_worker_stats(
-                worker_id, sessions, orders, items, duration_seconds, session_id,
-                get_current_timestamp(),
-            )
+        now = get_current_timestamp()
+        worker = None
 
-    def _add_worker_stats(self, worker_id, sessions, orders, items, duration_seconds, session_id, now):
-        data = self._load_workers_registry()
-        workers = data.get('workers', [])
+        def add(data):
+            nonlocal worker
+            for worker_dict in data.get('workers', []):
+                if worker_dict['id'] == worker_id:
+                    # Increment aggregate counters
+                    worker_dict['total_sessions'] = worker_dict.get('total_sessions', 0) + sessions
+                    worker_dict['total_orders'] = worker_dict.get('total_orders', 0) + orders
+                    worker_dict['total_items'] = worker_dict.get('total_items', 0) + items
+                    worker_dict['total_duration_seconds'] = worker_dict.get('total_duration_seconds', 0) + duration_seconds
 
-        for worker_dict in workers:
-            if worker_dict['id'] == worker_id:
-                # Increment aggregate counters
-                worker_dict['total_sessions'] = worker_dict.get('total_sessions', 0) + sessions
-                worker_dict['total_orders'] = worker_dict.get('total_orders', 0) + orders
-                worker_dict['total_items'] = worker_dict.get('total_items', 0) + items
-                worker_dict['total_duration_seconds'] = worker_dict.get('total_duration_seconds', 0) + duration_seconds
+                    # Update activity tracking
+                    worker_dict['last_active'] = now
+                    if session_id:
+                        worker_dict['last_session_id'] = session_id
 
-                # Update activity tracking
-                worker_dict['last_active'] = now
-                if session_id:
-                    worker_dict['last_session_id'] = session_id
+                    # Ensure version field exists
+                    worker_dict['version'] = REGISTRY_VERSION
 
-                # Ensure version field exists
-                worker_dict['version'] = "1.3.0"
+                    # Recalculate averages using WorkerProfile
+                    worker = WorkerProfile.from_dict(worker_dict)
+                    worker.recalculate_averages()
 
-                # Recalculate averages using WorkerProfile
-                worker = WorkerProfile.from_dict(worker_dict)
-                worker.recalculate_averages()
+                    # Update dict with recalculated values
+                    worker_dict.update(worker.to_dict())
+                    return
+            raise _NoSuchWorker(worker_id)
 
-                # Update dict with recalculated values
-                worker_dict.update(worker.to_dict())
+        try:
+            self._update_registry(add)
+        except _NoSuchWorker:
+            logger.warning(f"Worker not found for stats update: {worker_id}")
+            return
 
-                # Save
-                self._save_workers_registry(data)
-
-                logger.info(
-                    f"Updated stats for {worker_id}: "
-                    f"+{sessions} sessions, +{orders} orders, +{items} items, "
-                    f"+{duration_seconds}s duration (avg {worker.avg_time_per_order}s/order)"
-                )
-                return
-
-        logger.warning(f"Worker not found for stats update: {worker_id}")
+        logger.info(
+            f"Updated stats for {worker_id}: "
+            f"+{sessions} sessions, +{orders} orders, +{items} items, "
+            f"+{duration_seconds}s duration (avg {worker.avg_time_per_order}s/order)"
+        )
 

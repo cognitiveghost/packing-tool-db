@@ -367,7 +367,7 @@ def main(argv: list[str]) -> int:
 
         def details(sid: str, *, read: bool = True, **kwargs) -> None:
             made = by_id[sid]
-            files = load_session_details(made) if read else None
+            files = load_session_details(made, window.profile_manager.store) if read else None
             bridge.set_details(
                 details_payload(made, files, now=NOW, client=CLIENT, stamp=STAMP, **kwargs))
             bridge.set_page("details")
@@ -426,7 +426,7 @@ def main(argv: list[str]) -> int:
         # 8f: the files could not be read; the cause is the loader's own.
         broken = session_id(3, 1)
         try:
-            load_session_details(by_id[broken])
+            load_session_details(by_id[broken], window.profile_manager.store)
         except SessionFilesError as error:
             cause = error.cause
         else:

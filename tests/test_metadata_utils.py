@@ -12,6 +12,7 @@ from shared.metadata_utils import (
     load_session_summary,
     parse_timestamp,
 )
+from shared.store import FileStore
 
 
 def test_get_current_timestamp_is_timezone_aware():
@@ -82,6 +83,7 @@ def test_session_manager_metadata_timestamps_are_timezone_aware_like_the_rest_of
     session_info_path.write_text(json.dumps({"session_id": "s1"}), encoding="utf-8")
 
     mgr = session_manager.SessionManager.__new__(session_manager.SessionManager)
+    mgr.store = FileStore(tmp_path.parent)
     mgr.update_session_metadata(str(tmp_path), "DHL_Orders", "in_progress")
 
     saved = json.loads(session_info_path.read_text(encoding="utf-8"))

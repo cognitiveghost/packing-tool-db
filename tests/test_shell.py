@@ -152,7 +152,7 @@ def test_overflow_has_user_guide(window, monkeypatch):
     monkeypatch.setattr(main_window, "open_guide", lambda *args: calls.append(args))
     item = next(a for a in window.command_bar.overflow.actions() if a.text() == "User guide")
     item.trigger()
-    assert calls == [(window, str(window.profile_manager.base_path), "packing-tool")]
+    assert calls == [(window, window.profile_manager.store, "packing-tool")]
 
 
 def test_f1_opens_the_user_guide(window, monkeypatch):
@@ -165,7 +165,7 @@ def test_f1_opens_the_user_guide(window, monkeypatch):
     f1 = [s for s in window.findChildren(QShortcut) if s.key() == QKeySequence("F1")]
     assert len(f1) == 1
     f1[0].activated.emit()
-    assert calls == [(window, str(window.profile_manager.base_path), "packing-tool")]
+    assert calls == [(window, window.profile_manager.store, "packing-tool")]
 
 
 def test_the_sidebar_footer_reaches_what_the_overflow_used_to(window, monkeypatch):

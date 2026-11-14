@@ -22,7 +22,7 @@ CHOICES = [
 
 @pytest.fixture
 def workers(profile_manager):
-    return WorkerManager(str(profile_manager.base_path))
+    return WorkerManager(profile_manager.store)
 
 
 @pytest.fixture
@@ -64,14 +64,15 @@ def test_the_switch_context_marks_the_current_worker(pages, workers):
 
 
 def test_an_unreadable_worker_list_is_the_failed_shape_and_retry_recovers(pages, workers):
-    workers.workers_file.mkdir()  # open() on a directory raises OSError
+    registry = workers.store.local_path("Workers/workers.json")
+    registry.mkdir()  # reading a directory raises OSError
     pages.show_workers(startup=True)
     payload = pages.bridge.workers
     assert payload["mode"] == "failed"
     assert payload["error"]["title"] == "Couldn’t load the worker list."
     assert payload["error"]["path"] == str(workers.workers_dir)
 
-    workers.workers_file.rmdir()
+    registry.rmdir()
     workers.create_worker("Ivan")
     pages.bridge.retryWorkers()
     assert pages.bridge.workers["mode"] == "ready"

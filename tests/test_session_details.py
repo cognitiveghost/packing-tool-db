@@ -13,6 +13,13 @@ from packing_tool.session_details import (
     load_session_details,
     partial_summary,
 )
+from shared.store import FileStore
+
+
+@pytest.fixture
+def store(tmp_path):
+    """The server root: the work folder's files are read through it."""
+    return FileStore(tmp_path)
 
 
 @pytest.fixture
@@ -37,7 +44,7 @@ def _write(path, data):
     path.write_text(json.dumps(data), encoding="utf-8")
 
 
-def test_a_registry_entry_loads_its_details_from_the_summary(work_dir):
+def test_a_registry_entry_loads_its_details_from_the_summary(work_dir, store):
     _write(
         work_dir / "session_summary.json",
         {
@@ -49,27 +56,27 @@ def test_a_registry_entry_loads_its_details_from_the_summary(work_dir):
             "total_items": 62,
         },
     )
-    record = load_session_details(_entry(work_dir))["record"]
+    record = load_session_details(_entry(work_dir), store)["record"]
     assert record["worker_name"] == "W-004"
     assert record["pc_name"] == "WH-PC-02"
     assert (record["completed_orders"], record["total_orders"]) == (9, 14)
     assert record["total_items_packed"] == 62
 
 
-def test_the_list_name_comes_from_the_summary(work_dir):
+def test_the_list_name_comes_from_the_summary(work_dir, store):
     _write(
         work_dir / "session_summary.json",
         {"session_id": "2026-09-29_1", "packing_list_name": "DHL_Orders"},
     )
-    assert load_session_details(_entry(work_dir))["record"]["packing_list_name"] == "DHL_Orders"
+    assert load_session_details(_entry(work_dir), store)["record"]["packing_list_name"] == "DHL_Orders"
 
 
-def test_the_list_name_falls_back_to_the_registry(work_dir):
+def test_the_list_name_falls_back_to_the_registry(work_dir, store):
     _write(work_dir / "session_summary.json", {"session_id": "2026-09-29_1"})
-    assert load_session_details(_entry(work_dir))["record"]["packing_list_name"] == "Registry_Name"
+    assert load_session_details(_entry(work_dir), store)["record"]["packing_list_name"] == "Registry_Name"
 
 
-def test_an_unfinished_list_loads_from_packing_state_alone(work_dir):
+def test_an_unfinished_list_loads_from_packing_state_alone(work_dir, store):
     """The Shopify flow writes no per-list session_info.json, so a list still
     being packed has packing_state.json and nothing else."""
     _write(
@@ -82,7 +89,7 @@ def test_an_unfinished_list_loads_from_packing_state_alone(work_dir):
             "in_progress": {},
         },
     )
-    details = load_session_details(_entry(work_dir, status="in_progress"))
+    details = load_session_details(_entry(work_dir, status="in_progress"), store)
     record = details["record"]
     assert record["packing_list_name"] == "Registry_Name"
     assert record["start_time"] == "2026-09-29T08:10:00"
@@ -123,49 +130,49 @@ def test_nothing_completed_means_no_partial_summary():
     assert partial_summary({"completed": [], "skipped_orders": ["3"]}, {}) == {}
 
 
-def test_an_unreadable_summary_names_the_file_and_the_cause(work_dir):
+def test_an_unreadable_summary_names_the_file_and_the_cause(work_dir, store):
     (work_dir / "session_summary.json").write_text("{not json", encoding="utf-8")
     with pytest.raises(SessionFilesError) as caught:
-        load_session_details(_entry(work_dir))
+        load_session_details(_entry(work_dir), store)
     assert caught.value.path.endswith("session_summary.json")
     assert "not valid JSON" in caught.value.cause
 
 
-def test_an_unreadable_state_file_is_an_error_too(work_dir):
+def test_an_unreadable_state_file_is_an_error_too(work_dir, store):
     (work_dir / "packing_state.json").write_text("[", encoding="utf-8")
     with pytest.raises(SessionFilesError) as caught:
-        load_session_details(_entry(work_dir))
+        load_session_details(_entry(work_dir), store)
     assert caught.value.path.endswith("packing_state.json")
 
 
-def test_a_work_dir_with_no_files_says_so(work_dir):
+def test_a_work_dir_with_no_files_says_so(work_dir, store):
     with pytest.raises(SessionFilesError) as caught:
-        load_session_details(_entry(work_dir))
+        load_session_details(_entry(work_dir), store)
     assert caught.value.path == str(work_dir)
     assert caught.value.cause == "it holds no session files"
 
 
-def test_an_entry_with_no_work_dir_says_so():
+def test_an_entry_with_no_work_dir_says_so(store):
     with pytest.raises(SessionFilesError) as caught:
-        load_session_details({"session_id": "2026-09-29_1"})
+        load_session_details({"session_id": "2026-09-29_1"}, store)
     assert caught.value.cause == "it has no work folder"
 
 
-def test_an_unreadable_session_info_is_skipped(work_dir):
+def test_an_unreadable_session_info_is_skipped(work_dir, store):
     _write(work_dir / "session_summary.json", {"session_id": "2026-09-29_1"})
     (work_dir.parent / "session_info.json").write_text("{", encoding="utf-8")
-    assert load_session_details(_entry(work_dir))["session_info"] == {}
+    assert load_session_details(_entry(work_dir), store)["session_info"] == {}
 
 
-def test_a_resumed_session_loads_from_the_state_not_the_summary_its_last_end_wrote(work_dir):
+def test_a_resumed_session_loads_from_the_state_not_the_summary_its_last_end_wrote(work_dir, store):
     _write(work_dir / "session_summary.json", {"completed_orders": 2, "orders": [{}, {}]})
     _write(work_dir / "packing_state.json", {
         "progress": {"total_orders": 10},
         "completed": [{"order_number": f"#{n}", "items_count": 1} for n in range(5)],
         "in_progress": {},
     })
-    details = load_session_details(_entry(work_dir, status="in_progress"))
+    details = load_session_details(_entry(work_dir, status="in_progress"), store)
     assert details["record"]["completed_orders"] == 5
     assert len(details["session_summary"]["orders"]) == 5
-    finished = load_session_details(_entry(work_dir, status="completed"))
+    finished = load_session_details(_entry(work_dir, status="completed"), store)
     assert finished["record"]["completed_orders"] == 2

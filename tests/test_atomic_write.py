@@ -15,12 +15,13 @@ read-modify-write, not just the final write), so it gets the same
 temp-file-first crash-safety applied to its own locked-write step instead.
 """
 import json
-from pathlib import Path
+import os
 
 import pytest
 
 from shared.atomic_write import atomic_write_json
 from shared.stats_manager import StatsManager, StatsManagerError
+from shared.store import FileStore
 
 # ---------------------------------------------------------------------------
 # shared.atomic_write.atomic_write_json — the reference implementation
@@ -45,15 +46,15 @@ def test_atomic_write_json_creates_valid_file_and_leaves_no_temp_files(tmp_path)
 def test_atomic_write_json_retries_transient_failures_then_succeeds(tmp_path, monkeypatch):
     target = tmp_path / "data.json"
     calls = {"n": 0}
-    real_replace = Path.replace
+    real_replace = os.replace
 
-    def flaky_replace(self, dst):
+    def flaky_replace(src, dst):
         calls["n"] += 1
         if calls["n"] < 3:
             raise OSError("simulated transient SMB error")
-        return real_replace(self, dst)
+        return real_replace(src, dst)
 
-    monkeypatch.setattr(Path, "replace", flaky_replace)
+    monkeypatch.setattr("shared.atomic_write.os.replace", flaky_replace)
     monkeypatch.setattr("shared.atomic_write.time.sleep", lambda s: None)
 
     atomic_write_json(target, {"ok": True}, retries=5, retry_delay=0)
@@ -66,10 +67,10 @@ def test_atomic_write_json_raises_after_exhausting_retries_but_keeps_original_in
     target = tmp_path / "data.json"
     target.write_text('{"original": true}', encoding="utf-8")
 
-    def always_fail(self, dst):
+    def always_fail(src, dst):
         raise OSError("server unreachable")
 
-    monkeypatch.setattr(Path, "replace", always_fail)
+    monkeypatch.setattr("shared.atomic_write.os.replace", always_fail)
     monkeypatch.setattr("shared.atomic_write.time.sleep", lambda s: None)
 
     with pytest.raises(OSError):
@@ -92,15 +93,15 @@ def test_atomic_write_json_raises_after_exhausting_retries_but_keeps_original_in
 
 def test_packer_logic_state_write_retries_transient_failures_like_every_other_write_path(loaded_logic, monkeypatch):
     calls = {"n": 0}
-    real_replace = Path.replace
+    real_replace = os.replace
 
-    def flaky_replace(self, dst):
+    def flaky_replace(src, dst):
         calls["n"] += 1
         if calls["n"] < 3:
             raise OSError("simulated transient SMB error")
-        return real_replace(self, dst)
+        return real_replace(src, dst)
 
-    monkeypatch.setattr(Path, "replace", flaky_replace)
+    monkeypatch.setattr("shared.atomic_write.os.replace", flaky_replace)
     monkeypatch.setattr("shared.atomic_write.time.sleep", lambda s: None)
 
     state = loaded_logic._build_state_dict()
@@ -152,21 +153,23 @@ def test_save_session_summary_does_not_corrupt_file_on_write_failure(loaded_logi
 # ---------------------------------------------------------------------------
 
 def test_stats_manager_atomic_update_is_actually_crash_safe(tmp_path, monkeypatch):
-    manager = StatsManager(str(tmp_path), max_retries=2, retry_delay=0)
+    manager = StatsManager(FileStore(tmp_path), max_retries=2, retry_delay=0)
+    stats_file = manager.store.local_path("Stats/global_stats.json")
     manager.record_packing(client_id="M", session_id="s1", worker_id="w1", orders_count=5, items_count=10)
-    assert json.loads(manager.stats_file.read_text(encoding="utf-8"))["total_orders_packed"] == 5
+    assert json.loads(stats_file.read_text(encoding="utf-8"))["total_orders_packed"] == 5
 
     def failing_dump(data, fp, **kwargs):
         fp.write('{"start of a new record but')  # simulate a write that dies partway through
         raise OSError("network share dropped")
 
-    monkeypatch.setattr("shared.stats_manager.json.dump", failing_dump)
+    # The Store's writes serialize through shared.atomic_write, which holds the json module.
+    monkeypatch.setattr("shared.atomic_write.json.dump", failing_dump)
 
     with pytest.raises(StatsManagerError):
         manager.record_packing(client_id="M", session_id="s2", worker_id="w1", orders_count=1, items_count=1)
 
     # The failing write only ever touched a temp file — the previously-good
     # record must survive intact, and no temp file is left behind.
-    preserved = json.loads(manager.stats_file.read_text(encoding="utf-8"))
+    preserved = json.loads(stats_file.read_text(encoding="utf-8"))
     assert preserved["total_orders_packed"] == 5
-    assert not list(manager.stats_file.parent.glob(".*_tmp_*"))
+    assert not list(stats_file.parent.glob(".*_tmp_*"))

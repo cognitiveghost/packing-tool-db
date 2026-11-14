@@ -181,7 +181,7 @@ class MainWindow(QMainWindow):
                 Use a dev config (e.g. config.dev.ini) to point at a local mock server.
         """
         super().__init__()
-        self.setWindowTitle(" ".join((APP_NAME, __version__)) + _DB_TRIAL)
+        self.setWindowTitle(" ".join((APP_NAME, __version__ + _DB_TRIAL)))
 
         from shared.theme import restore_window_geometry
 
@@ -234,8 +234,7 @@ class MainWindow(QMainWindow):
         logger.info("SessionLockManager initialized successfully")
 
         # Initialize WorkerManager
-        base_path = self.profile_manager.base_path
-        self.worker_manager = WorkerManager(str(base_path))
+        self.worker_manager = WorkerManager(self.profile_manager.store)
         logger.info("WorkerManager initialized successfully")
 
         # Initialize SessionRegistryManager (per-client index for fast browser loading)
@@ -275,7 +274,7 @@ class MainWindow(QMainWindow):
         # 3. Warehouse operation audit trail and worker performance metrics
         # 4. Per-client analytics and reporting
         # Note: Called once per session (at completion) by design - records session totals
-        self.stats_manager = StatsManager(base_path=str(base_path))
+        self.stats_manager = StatsManager(self.profile_manager.store)
 
         # Settings for remembering last client
         self.settings = QSettings("PackingTool-DB", "ClientSelection")
@@ -552,7 +551,7 @@ class MainWindow(QMainWindow):
         help_shortcut.activated.connect(self._open_user_guide)
 
     def _open_user_guide(self):
-        open_guide(self, str(self.profile_manager.base_path), "packing-tool")
+        open_guide(self, self.profile_manager.store, "packing-tool")
 
     def _go_to_page(self, page: int):
         """Ctrl+1/2/3. Nothing to go to until a client is chosen, and not
@@ -1540,7 +1539,6 @@ class MainWindow(QMainWindow):
                     except Exception as exc:
                         logger.exception("save_session_summary failed")
                         try:
-                            from shared.atomic_write import atomic_write_json
                             from shared.metadata_utils import get_current_timestamp
 
                             _minimal = {
@@ -1555,9 +1553,7 @@ class MainWindow(QMainWindow):
                                 "completed_at": get_current_timestamp(),
                                 "error": str(exc),
                             }
-                            atomic_write_json(
-                                _summary_path, _minimal, indent=2, ensure_ascii=False
-                            )
+                            _logic_ref.store.write_json(_logic_ref.summary_rel(), _minimal)
                         except Exception as minimal_exc:
                             logger.debug(
                                 f"Failed to write minimal session summary fallback: {minimal_exc}"
@@ -2292,7 +2288,9 @@ class MainWindow(QMainWindow):
 
         # Create SessionManager for this client if not exists
         if not self.session_manager or self.session_manager.client_id != client_id:
-            self.session_manager = SessionManager(client_id=client_id)
+            self.session_manager = SessionManager(
+                client_id=client_id, store=self.profile_manager.store
+            )
 
         if work_dir is None:
             try:

@@ -151,14 +151,14 @@ def test_closing_the_window_stops_the_sessions_timer(main_window):
 
 
 def test_a_free_list_is_locked(main_window, tmp_path):
-    work_dir = tmp_path / "L"
+    work_dir = main_window.profile_manager.store.local_path("L")
     work_dir.mkdir()
     assert main_window._acquire_lock("TESTCL", work_dir) == (True, None, None)
     main_window.lock_manager.release_lock(work_dir)
 
 
 def test_a_take_over_releases_that_stale_lock_and_takes_it(main_window, tmp_path):
-    work_dir = tmp_path / "L"
+    work_dir = main_window.profile_manager.store.local_path("L")
     work_dir.mkdir()
     stale = _lock(work_dir, age_seconds=600)
     assert main_window._acquire_lock("TESTCL", work_dir, stale) == (True, None, "WH-PC-02")
@@ -169,7 +169,7 @@ def test_a_take_over_releases_that_stale_lock_and_takes_it(main_window, tmp_path
 def test_a_stale_lock_nobody_was_asked_about_is_not_taken(main_window, tmp_path):
     """The list was behind, or this is a Retry of frame 3c: no question was
     answered, so nothing is released."""
-    work_dir = tmp_path / "L"
+    work_dir = main_window.profile_manager.store.local_path("L")
     work_dir.mkdir()
     _lock(work_dir, age_seconds=600)
     assert main_window._acquire_lock("TESTCL", work_dir) == (False, STALE_SENTENCE, None)
@@ -177,7 +177,7 @@ def test_a_stale_lock_nobody_was_asked_about_is_not_taken(main_window, tmp_path)
 
 
 def test_a_live_lock_is_refused_with_the_locks_own_message(main_window, tmp_path):
-    work_dir = tmp_path / "L"
+    work_dir = main_window.profile_manager.store.local_path("L")
     work_dir.mkdir()
     live = _lock(work_dir, age_seconds=5)
     ok, message, taken_from = main_window._acquire_lock("TESTCL", work_dir, live)

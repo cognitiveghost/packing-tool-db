@@ -1,11 +1,12 @@
 """
-Session Lock Manager for preventing concurrent access to sessions.
+Session lock for a packing list's work folder, on top of the shared Store.
 
-This module provides file-based locking mechanism to ensure that only one
-user can work on a session at a time, with crash recovery support.
+The lock is `.session.lock` in the work folder (the JSON the other PCs read).
+Taking, renewing, releasing and force-taking go through the Store's list-lock
+methods; this module reads the lock back for the Packer's checks and turns
+each answer into the Packer's messages.
 """
 
-import json
 import logging
 import os
 import socket
@@ -13,13 +14,22 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from packing_tool import __version__
-from shared.atomic_write import atomic_write_json
+from shared.metadata_utils import parse_timestamp
+from shared.store import LOCK_FILENAME, STALE_SECONDS, StoreError, StoreNotFound
 
 LOCK_READ_ATTEMPTS = 3
 LOCK_READ_RETRY_SECONDS = 0.2
 LOCK_UNREADABLE_MSG = "The session lock could not be read. Try again in a moment."
 LOCK_RACE_MSG = "Another PC opened this session a moment ago. Try again in a moment."
+REQUIRED_LOCK_FIELDS = ("locked_by", "user_name", "lock_time", "heartbeat")
+
+
+def _is_valid(data) -> bool:
+    return isinstance(data, dict) and all(k in data for k in REQUIRED_LOCK_FIELDS)
+
+
+def _is_unreadable(data) -> bool:
+    return isinstance(data, dict) and data.get("unreadable") is True
 
 
 class SessionLockManager:
@@ -27,29 +37,32 @@ class SessionLockManager:
     Manages session locks to prevent concurrent access.
 
     Features:
-    - File-based locking with .session.lock files
+    - Lock file `.session.lock` in the work folder, via the Store's list-lock methods
     - Heartbeat mechanism to detect crashed sessions
     - Stale lock detection and recovery
     - Detailed lock information for UI display
     """
 
-    LOCK_FILENAME = ".session.lock"
+    LOCK_FILENAME = LOCK_FILENAME
     HEARTBEAT_INTERVAL = 60  # seconds - how often to update heartbeat
-    STALE_TIMEOUT = 120  # seconds - lock is stale after 2 minutes without heartbeat
+    STALE_TIMEOUT = STALE_SECONDS  # seconds - lock is stale after 2 minutes without heartbeat
 
     def __init__(self, profile_manager):
         """
         Initialize SessionLockManager.
 
         Args:
-            profile_manager: ProfileManager instance for accessing session directories
+            profile_manager: ProfileManager instance; its `store` holds the work folders
         """
         self.profile_manager = profile_manager
         self.logger = logging.getLogger(self.__class__.__name__)
         self.hostname = socket.gethostname()
         self.username = self._get_username()
         self.process_id = os.getpid()
-        self.app_version = __version__
+
+    @property
+    def store(self):
+        return self.profile_manager.store
 
     def _get_username(self) -> str:
         """
@@ -64,6 +77,61 @@ class SessionLockManager:
             # Fallback to environment variable
             return os.environ.get('USERNAME', 'Unknown')
 
+    def _dir_rel(self, session_dir) -> str:
+        """Store path (POSIX, relative to the server root) of the work folder."""
+        return Path(session_dir).relative_to(self.store.local_path("")).as_posix()
+
+    def _mine(self, data: dict) -> bool:
+        return data.get('locked_by') == self.hostname and data.get('process_id') == self.process_id
+
+    def _read(self, session_dir) -> dict | None:
+        """
+        The lock file's contents: None when there is no lock file.
+
+        A read that keeps failing is not "no lock": it returns an unreadable lock
+        held by an unknown PC, aged by the file's mtime (Phase 12 Bundle 2, B1).
+        Invalid contents are returned as they are; the callers decide.
+        """
+        rel = f"{self._dir_rel(session_dir)}/{LOCK_FILENAME}"
+        data = None
+        last_error = None
+        for attempt in range(LOCK_READ_ATTEMPTS):
+            try:
+                data = self.store.read_json(rel)
+                break
+            except StoreNotFound:
+                return None  # released between the caller's look and this read
+            except StoreError as e:
+                last_error = e
+                if attempt < LOCK_READ_ATTEMPTS - 1:
+                    time.sleep(LOCK_READ_RETRY_SECONDS)
+        if data is not None:
+            return data
+
+        self.logger.warning(
+            f"Failed to read lock file: {last_error}",
+            extra={"session_dir": str(session_dir)}
+        )
+        now = datetime.now().astimezone().isoformat()
+        try:
+            # A live owner rewrites the lock every 60 s, renewing the mtime; one left
+            # empty by a crash mid-create ages out through the stale-lock prompt.
+            heartbeat = datetime.fromtimestamp(
+                self.store.local_path(rel).stat().st_mtime
+            ).astimezone().isoformat()
+        except OSError:
+            heartbeat = now
+        return {
+            "unreadable": True,
+            "locked_by": "unknown PC",
+            "user_name": "unknown",
+            "lock_time": now,
+            "heartbeat": heartbeat,
+            "process_id": None,
+            "worker_id": None,
+            "worker_name": None,
+        }
+
     def acquire_lock(
         self,
         client_id: str,
@@ -73,6 +141,9 @@ class SessionLockManager:
     ) -> tuple[bool, str | None, dict | None]:
         """
         Attempt to acquire a lock on the session.
+
+        worker_id and worker_name are accepted for the callers. The Store's lock
+        does not record them, so they are not written to the lock file.
 
         Args:
             client_id: Client identifier
@@ -85,99 +156,51 @@ class SessionLockManager:
             - (True, None, None) if lock acquired successfully
             - (False, error_message, lock_info) if session is locked by another process
               (lock_info is None when the failure is a file I/O error)
-
-        Raises:
-            IOError: If file operations fail
         """
-        lock_path = session_dir / self.LOCK_FILENAME
-
-        # Check if lock already exists
-        if lock_path.exists():
-            is_locked, lock_info = self.is_locked(session_dir)
-
-            if is_locked:
-                if lock_info.get("unreadable") and not self.is_lock_stale(lock_info):
-                    return False, LOCK_UNREADABLE_MSG, None
-
-                # Check if it's our own lock (same PC and process)
-                if (lock_info.get('locked_by') == self.hostname and
-                    lock_info.get('process_id') == self.process_id):
-                    # It's our own lock, just update heartbeat
-                    self.logger.info(
-                        f"Reacquiring own lock for session {session_dir.name}",
-                        extra={"client_id": client_id, "session_dir": str(session_dir)}
-                    )
-                    self.update_heartbeat(session_dir)
-                    return True, None, None
-                else:
-                    # Check if lock is stale
-                    if self.is_lock_stale(lock_info):
-                        error_msg = self._format_stale_lock_message(lock_info)
-                        self.logger.warning(
-                            "Session has stale lock",
-                            extra={
-                                "client_id": client_id,
-                                "session_dir": str(session_dir),
-                                "original_lock_by": lock_info.get('locked_by'),
-                                "stale_for_minutes": self._get_stale_minutes(lock_info)
-                            }
-                        )
-                        return False, error_msg, lock_info
-                    else:
-                        # Active lock by another process
-                        error_msg = self._format_active_lock_message(lock_info)
-                        self.logger.warning(
-                            "Attempt to open locked session",
-                            extra={
-                                "client_id": client_id,
-                                "session_dir": str(session_dir),
-                                "locked_by": lock_info.get('locked_by'),
-                                "attempted_by": self.hostname
-                            }
-                        )
-                        return False, error_msg, lock_info
-
-        # Create new lock
         try:
-            lock_data = {
-                "locked_by": self.hostname,
-                "user_name": self.username,
-                "lock_time": datetime.now().astimezone().isoformat(),
-                "process_id": self.process_id,
-                "app_version": self.app_version,
-                "heartbeat": datetime.now().astimezone().isoformat(),
-                "worker_id": worker_id,
-                "worker_name": worker_name
-            }
-
-            # Exclusive create: two PCs past the check above cannot both win (spec B2).
-            if lock_path.exists() and not self.is_locked(session_dir)[0]:
-                lock_path.unlink()  # still present but invalid; a valid one fails O_EXCL below
-            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(lock_data, f, indent=2)
-
-            self.logger.info(
-                "Session lock acquired successfully",
-                extra={
-                    "client_id": client_id,
-                    "session_dir": str(session_dir),
-                    "locked_by": self.hostname,
-                    "user_name": self.username
-                }
-            )
-            return True, None, None
-
-        except FileExistsError:
-            self.logger.warning("Lost the lock-creation race", extra={"session_dir": str(session_dir)})
-            return False, LOCK_RACE_MSG, None
-
+            info = self.store.acquire_list_lock(self._dir_rel(session_dir), self.hostname, self.username)
         except Exception as e:
             self.logger.exception(
                 "Failed to acquire lock",
                 extra={"client_id": client_id, "session_dir": str(session_dir)},
             )
             return False, f"Failed to create lock file: {e}", None
+        if info.acquired:
+            self.logger.info(
+                "Session lock acquired successfully",
+                extra={"client_id": client_id, "session_dir": str(session_dir)}
+            )
+            return True, None, None
+
+        # Refused: say why, from the lock as it reads now.
+        _is_locked, lock_info = self.is_locked(session_dir)
+        if lock_info is None:
+            return False, LOCK_RACE_MSG, None  # gone or invalid since the Store looked
+        if lock_info.get("unreadable") and not self.is_lock_stale(lock_info):
+            return False, LOCK_UNREADABLE_MSG, None
+
+        if self.is_lock_stale(lock_info):
+            self.logger.warning(
+                "Session has stale lock",
+                extra={
+                    "client_id": client_id,
+                    "session_dir": str(session_dir),
+                    "original_lock_by": lock_info.get('locked_by'),
+                    "stale_for_minutes": self._get_stale_minutes(lock_info)
+                }
+            )
+            return False, self._format_stale_lock_message(lock_info), lock_info
+
+        self.logger.warning(
+            "Attempt to open locked session",
+            extra={
+                "client_id": client_id,
+                "session_dir": str(session_dir),
+                "locked_by": lock_info.get('locked_by'),
+                "attempted_by": self.hostname
+            }
+        )
+        return False, self._format_active_lock_message(lock_info), lock_info
 
     def release_lock(self, session_dir: Path) -> bool:
         """
@@ -189,40 +212,35 @@ class SessionLockManager:
         Returns:
             True if lock was released, False otherwise
         """
-        lock_path = session_dir / self.LOCK_FILENAME
-
-        if not lock_path.exists():
-            self.logger.debug(f"No lock file to release: {lock_path}")
-            return True
-
         try:
-            # Verify it's our lock before deleting
-            is_locked, lock_info = self.is_locked(session_dir)
-            if is_locked:
-                if (lock_info.get('locked_by') == self.hostname and
-                    lock_info.get('process_id') == self.process_id):
-                    # It's our lock, safe to delete
-                    lock_path.unlink()
-                    self.logger.info(
-                        "Session lock released",
-                        extra={"session_dir": str(session_dir)}
-                    )
-                    return True
-                else:
-                    # Not our lock, don't delete
-                    self.logger.warning(
-                        "Attempted to release lock owned by another process",
-                        extra={
-                            "session_dir": str(session_dir),
-                            "lock_owner": lock_info.get('locked_by'),
-                            "attempted_by": self.hostname
-                        }
-                    )
-                    return False
-            else:
-                # Lock file exists but invalid, safe to delete
-                lock_path.unlink()
+            data = self._read(session_dir)
+            if data is None:
+                self.logger.debug(f"No lock file to release: {session_dir / LOCK_FILENAME}")
                 return True
+
+            if _is_unreadable(data) or (_is_valid(data) and not self._mine(data)):
+                # Not ours (or not readable, so not known to be free): don't delete
+                self.logger.warning(
+                    "Attempted to release lock owned by another process",
+                    extra={
+                        "session_dir": str(session_dir),
+                        "lock_owner": data.get('locked_by'),
+                        "attempted_by": self.hostname
+                    }
+                )
+                return False
+
+            if not _is_valid(data):
+                # Invalid contents, safe to delete
+                self.store.delete(f"{self._dir_rel(session_dir)}/{LOCK_FILENAME}")
+                return True
+
+            self.store.release_list_lock(self._dir_rel(session_dir), self.hostname)
+            self.logger.info(
+                "Session lock released",
+                extra={"session_dir": str(session_dir)}
+            )
+            return True
 
         except Exception:
             self.logger.exception(
@@ -241,69 +259,25 @@ class SessionLockManager:
         Returns:
             Tuple of (is_locked: bool, lock_info: Optional[Dict])
             - (False, None) if not locked or lock file invalid
-            - (True, lock_info_dict) if locked with lock details
+            - (True, lock_info_dict) if locked with lock details; an unreadable
+              lock is locked, with "unreadable": True
         """
-        lock_path = session_dir / self.LOCK_FILENAME
-
-        if not lock_path.exists():
+        data = self._read(session_dir)
+        if data is None:
             return False, None
-
-        lock_info = None
-        last_error = None
-        for attempt in range(LOCK_READ_ATTEMPTS):
-            try:
-                with open(lock_path, 'r', encoding='utf-8') as f:
-                    lock_info = json.load(f)
-                break
-            except FileNotFoundError:
-                return False, None  # released between the exists() check and the read
-            except (OSError, json.JSONDecodeError) as e:
-                last_error = e
-                if attempt < LOCK_READ_ATTEMPTS - 1:
-                    time.sleep(LOCK_READ_RETRY_SECONDS)
-
-        if lock_info is None:
-            # A lock another PC is rewriting reads as broken for a moment. An
-            # unreadable lock is held, never free: treating it as free let two
-            # PCs open the same list (Phase 12 Bundle 2, B1).
+        if _is_unreadable(data):
+            return True, data
+        if not _is_valid(data):
             self.logger.warning(
-                f"Failed to read lock file: {last_error}",
-                extra={"session_dir": str(session_dir)}
-            )
-            now = datetime.now().astimezone().isoformat()
-            try:
-                # A live owner rewrites the lock every 60 s, renewing the mtime; one left
-                # empty by a crash mid-create ages out through the stale-lock prompt.
-                heartbeat = datetime.fromtimestamp(lock_path.stat().st_mtime).astimezone().isoformat()
-            except OSError:
-                heartbeat = now
-            return True, {
-                "unreadable": True,
-                "locked_by": "unknown PC",
-                "user_name": "unknown",
-                "lock_time": now,
-                "heartbeat": heartbeat,
-                "process_id": None,
-                "worker_id": None,
-                "worker_name": None,
-            }
-
-        # Validate lock info has required fields
-        required_fields = ['locked_by', 'user_name', 'lock_time', 'heartbeat']
-        if not isinstance(lock_info, dict) or not all(field in lock_info for field in required_fields):
-            self.logger.warning(
-                f"Invalid lock file (missing fields): {lock_path}",
+                f"Invalid lock file (missing fields): {Path(session_dir) / LOCK_FILENAME}",
                 extra={"session_dir": str(session_dir)}
             )
             return False, None
 
         # Ensure worker fields exist (backward compatibility)
-        if 'worker_id' not in lock_info:
-            lock_info['worker_id'] = None
-        if 'worker_name' not in lock_info:
-            lock_info['worker_name'] = None
-
-        return True, lock_info
+        data.setdefault('worker_id', None)
+        data.setdefault('worker_name', None)
+        return True, data
 
     def owns_lock(self, session_dir: Path) -> bool | None:
         """
@@ -316,7 +290,7 @@ class SessionLockManager:
         is_locked, info = self.is_locked(session_dir)
         if not is_locked or info.get("unreadable"):
             return None
-        return info.get("locked_by") == self.hostname and info.get("process_id") == self.process_id
+        return self._mine(info)
 
     def update_heartbeat(self, session_dir: Path) -> bool:
         """
@@ -331,41 +305,22 @@ class SessionLockManager:
         Returns:
             True if heartbeat updated successfully, False otherwise
         """
-        lock_path = session_dir / self.LOCK_FILENAME
-
-        if not lock_path.exists():
-            self.logger.warning(
-                "Cannot update heartbeat: lock file doesn't exist",
-                extra={"session_dir": str(session_dir)}
-            )
-            return False
-
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                with open(lock_path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-
-                # Verify it's our lock
-                if (data.get('locked_by') != self.hostname or
-                    data.get('process_id') != self.process_id):
-                    self.logger.warning(
-                        "Attempted to update heartbeat for lock owned by another process",
+                if self.store.heartbeat_list_lock(self._dir_rel(session_dir), self.hostname):
+                    self.logger.debug(
+                        "Heartbeat updated",
                         extra={"session_dir": str(session_dir)}
                     )
-                    return False
-
-                # Update heartbeat, rewriting atomically so a reader never sees a half-written lock
-                data['heartbeat'] = datetime.now().astimezone().isoformat()
-                atomic_write_json(lock_path, data, indent=2)
-
-                self.logger.debug(
-                    "Heartbeat updated",
+                    return True
+                self.logger.warning(
+                    "Cannot update heartbeat: no lock of ours in this folder",
                     extra={"session_dir": str(session_dir)}
                 )
-                return True
+                return False
 
-            except (OSError, json.JSONDecodeError) as e:
+            except Exception as e:
                 # Network issue or file error - don't crash
                 self.logger.warning(
                     f"Failed to update heartbeat (attempt {attempt + 1}/{max_retries}): {e}",
@@ -373,8 +328,6 @@ class SessionLockManager:
                 )
                 if attempt < max_retries - 1:
                     time.sleep(0.5)
-                else:
-                    return False
 
         return False
 
@@ -393,7 +346,6 @@ class SessionLockManager:
             if not heartbeat_str:
                 return True
 
-            from shared.metadata_utils import parse_timestamp
             heartbeat_time = parse_timestamp(heartbeat_str)
             if not heartbeat_time:
                 return True  # Can't parse, consider stale
@@ -415,53 +367,46 @@ class SessionLockManager:
         Args:
             session_dir: Path to session directory
             expected: The stale lock the user was asked about. When given, the
-                lock is released only if it is still that lock and still stale:
+                lock is taken over only if it is still that lock and still stale:
                 while the question was open its owner may have come back, or
                 another PC may have taken the list (AUDIT-02-1).
 
         Returns:
-            True if lock was released, False otherwise
+            True if lock was released (or taken over), False otherwise
         """
-        lock_path = session_dir / self.LOCK_FILENAME
-
-        if not lock_path.exists():
-            return True
-
         try:
-            # Get lock info for logging
-            _is_locked, lock_info = self.is_locked(session_dir)
-            if expected is not None and lock_info is not None:
-                same = all(
-                    lock_info.get(k) == expected.get(k)
-                    for k in ("locked_by", "process_id", "heartbeat")
-                )
-                if not (same and self.is_lock_stale(lock_info)):
-                    self.logger.warning(
-                        "Stale lock changed before force-release; left in place",
-                        extra={"session_dir": str(session_dir)},
-                    )
-                    return False
+            lock_info = self._read(session_dir)
+            if lock_info is None:
+                return True
 
-            # Delete the lock file
-            lock_path.unlink()
+            if expected is None or not _is_valid(lock_info):
+                # Nothing to check against: remove it (an invalid file has no owner to protect)
+                self.store.delete(f"{self._dir_rel(session_dir)}/{LOCK_FILENAME}")
+                self._log_forced(lock_info, session_dir)
+                return True
 
-            if lock_info:
-                stale_minutes = self._get_stale_minutes(lock_info)
+            same = all(lock_info.get(k) == expected.get(k) for k in ("locked_by", "process_id", "heartbeat"))
+            if not (same and self.is_lock_stale(lock_info)):
                 self.logger.warning(
-                    "Stale lock force-released",
-                    extra={
-                        "session_dir": str(session_dir),
-                        "original_lock_by": lock_info.get('locked_by'),
-                        "released_by": self.hostname,
-                        "stale_for_minutes": stale_minutes
-                    }
+                    "Stale lock changed before force-release; left in place",
+                    extra={"session_dir": str(session_dir)},
                 )
-            else:
-                self.logger.info(
-                    "Invalid lock file removed",
-                    extra={"session_dir": str(session_dir)}
-                )
+                return False
 
+            # Store takes the folder only if the heartbeat is still the one asked about.
+            taken = self.store.force_take_list_lock(
+                self._dir_rel(session_dir),
+                self.hostname,
+                self.username,
+                parse_timestamp(expected.get("heartbeat")),
+            )
+            if not taken:
+                self.logger.warning(
+                    "Stale lock changed before force-release; left in place",
+                    extra={"session_dir": str(session_dir)},
+                )
+                return False
+            self._log_forced(lock_info, session_dir)
             return True
 
         except Exception:
@@ -471,6 +416,23 @@ class SessionLockManager:
             )
             return False
 
+    def _log_forced(self, lock_info: dict, session_dir) -> None:
+        if _is_valid(lock_info):
+            self.logger.warning(
+                "Stale lock force-released",
+                extra={
+                    "session_dir": str(session_dir),
+                    "original_lock_by": lock_info.get('locked_by'),
+                    "released_by": self.hostname,
+                    "stale_for_minutes": self._get_stale_minutes(lock_info)
+                }
+            )
+        else:
+            self.logger.info(
+                "Invalid lock file removed",
+                extra={"session_dir": str(session_dir)}
+            )
+
     def _get_stale_minutes(self, lock_info: dict) -> int:
         """Get how many minutes the lock has been stale."""
         try:
@@ -478,7 +440,6 @@ class SessionLockManager:
             if not heartbeat_str:
                 return 0
 
-            from shared.metadata_utils import parse_timestamp
             heartbeat_time = parse_timestamp(heartbeat_str)
             if not heartbeat_time:
                 return 0
@@ -512,4 +473,3 @@ class SessionLockManager:
             f"The application may have crashed.\n"
             f"You can force-release the lock."
         )
-

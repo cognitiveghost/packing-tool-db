@@ -95,7 +95,8 @@ def rows(made):
 
 
 def work_dir(tmp_path, name="2026-10-06_2"):
-    path = tmp_path / name / "packing" / "Afternoon_wave"
+    # Under the server root (conftest's server_root): the Packer reads sessions through its store.
+    path = tmp_path / "server" / "Sessions" / "CLIENT_TEST" / name / "packing" / "Afternoon_wave"
     path.mkdir(parents=True, exist_ok=True)
     return path
 

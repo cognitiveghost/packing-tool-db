@@ -22,7 +22,7 @@ from PySide6.QtCore import QObject, Signal
 from packing_tool.async_state_writer import AsyncStateWriter
 from packing_tool.exceptions import PackingListInvalidError, PackingStateUnreadableError
 from packing_tool.json_cache import invalidate_json_cache
-from shared.atomic_write import atomic_write_json
+from shared.store import StoreError, StoreNotFound
 
 # Initialize module-level logger
 logger = logging.getLogger(__name__)
@@ -198,6 +198,7 @@ class PackerLogic(QObject):
         self.client_id = client_id
         self.profile_manager = profile_manager
         self.work_dir = Path(work_dir)
+        self.store = profile_manager.store  # the server root; state and summary go through it
 
         # Create subdirectories
         # work_dir is packing/{list_name}/ (from Shopify session)
@@ -333,46 +334,42 @@ class PackerLogic(QObject):
         logger.info(f"Updating SKU mapping: {len(sku_map)} entries")
         self.sku_map = {self._normalize_sku(k): v for k, v in sku_map.items()}
 
-    def _get_state_file_path(self) -> str:
-        """
-        Return path to packing_state.json in work_dir root.
+    def _rel(self, path) -> str:
+        """Store path (POSIX, relative to the server root) of a file under it."""
+        return Path(path).relative_to(self.store.local_path("")).as_posix()
 
-        For unified workflow: work_dir/packing_state.json
-        For Excel workflow: barcodes/packing_state.json (backward compatible)
-        """
-        return str(self.work_dir / STATE_FILE_NAME)
+    def _state_rel(self) -> str:
+        """Store path of packing_state.json in work_dir root (unified and Excel workflows alike)."""
+        return self._rel(self.work_dir / STATE_FILE_NAME)
 
-    def _get_summary_file_path(self) -> str:
-        """
-        Return path to session_summary.json in work_dir root.
+    def summary_rel(self) -> str:
+        """Store path of session_summary.json in work_dir root."""
+        return self._rel(self.work_dir / SUMMARY_FILE_NAME)
 
-        For unified workflow: work_dir/session_summary.json
-        For Excel workflow: barcodes/session_summary.json (backward compatible)
-        """
-        return str(self.work_dir / SUMMARY_FILE_NAME)
-
-    def _read_state_file(self, state_file: str) -> dict:
-        """Read packing_state.json straight from disk, retrying transient errors.
+    def _read_state_file(self, rel: str) -> dict:
+        """Read packing_state.json through the store, retrying transient errors.
 
         Not through JSONCache: its get() returns the default on any error,
         which is exactly what hid a network hiccup as "no saved progress".
+        StoreNotFound (no file yet) is not retried and passes to the caller.
         """
         last_error = None
         for attempt in range(STATE_READ_ATTEMPTS):
             try:
-                with open(state_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-            except (OSError, ValueError) as exc:  # JSONDecodeError is a ValueError
-                last_error = exc
+                data = self.store.read_json(rel)
+            except StoreNotFound:
+                raise
+            except StoreError as exc:  # the OS or JSON cause is chained
+                last_error = exc.__cause__ or exc
                 if attempt < STATE_READ_ATTEMPTS - 1:
                     time.sleep(STATE_READ_RETRY_SECONDS)
                 continue
             if not isinstance(data, dict):
                 raise PackingStateUnreadableError(
-                    f"{state_file}: root is {type(data).__name__}, not an object"
+                    f"{self.store.local_path(rel)}: root is {type(data).__name__}, not an object"
                 )
             return data
-        raise PackingStateUnreadableError(f"{state_file}: {last_error}")
+        raise PackingStateUnreadableError(f"{self.store.local_path(rel)}: {last_error}")
 
     def _load_session_state(self):
         """
@@ -385,14 +382,13 @@ class PackerLogic(QObject):
         Raises PackingStateUnreadableError if the file exists but cannot be read: a
         session must never open empty over saved progress.
         """
-        state_file = self._get_state_file_path()
-
-        if not os.path.exists(state_file):
+        try:
+            data = self._read_state_file(self._state_rel())
+        except StoreNotFound:
             logger.debug("No existing session state found, starting fresh")
             self.session_packing_state = {'in_progress': {}, 'completed_orders': [], 'skipped_orders': [], 'skipped_orders_timing': {}}
             return
 
-        data = self._read_state_file(state_file)
         # Legacy format wrapped the state in {"data": {...}}
         state_data = data["data"] if isinstance(data.get("data"), dict) else data
 
@@ -663,15 +659,15 @@ class PackerLogic(QObject):
             logger.warning("State write dropped: this PC no longer holds the session lock")
             return
 
-        state_file = self._get_state_file_path()
         total_orders = state_data.get("progress", {}).get("total_orders", 0)
         completed_orders_count = state_data.get("progress", {}).get("completed_orders", 0)
         packed_items = state_data.get("progress", {}).get("packed_items", 0)
         total_items = state_data.get("progress", {}).get("total_items", 0)
 
         try:
-            atomic_write_json(state_file, state_data)
-            invalidate_json_cache(state_file)
+            rel = self._state_rel()
+            self.store.write_json(rel, state_data)  # atomic: temp file + rename
+            invalidate_json_cache(str(self.store.local_path(rel)))
         except Exception:
             logger.exception("CRITICAL: Failed to save session state")
             self._set_save_ok(False)
@@ -1933,13 +1929,13 @@ class PackerLogic(QObject):
 
         # Determine output path
         if not summary_path:
-            summary_path = self._get_summary_file_path()
+            summary_path = str(self.work_dir / SUMMARY_FILE_NAME)
 
-        # Save to file atomically (temp file + rename), same as every other
+        # Save through the store (atomic: temp file + rename), same as every other
         # write path — a failure partway through must never truncate a
         # previously-good summary in place.
         try:
-            atomic_write_json(summary_path, summary)
+            self.store.write_json(self._rel(summary_path), summary)
 
             logger.info(f"Session summary (v1.3.0) saved to: {summary_path}")
             return summary_path
