@@ -191,6 +191,7 @@
   "Nothing on the server changed.": "Нищо на сървъра не се е променило.",
   "Nothing packed on that line yet": "Още нищо не е опаковано на този ред",
   "Nothing {span} has “{query}” in its id, packing list, worker or PC.": "Нищо {span} не съдържа „{query}“ в номера си, списъка за опаковане, работника или компютъра.",
+  "Offline progress kept aside": "Офлайн напредъкът е запазен отделно",
   "Once you save, scanning this barcode on any PC will no longer count as {sku}.": "След запазване сканирането на този баркод на който и да е компютър повече няма да се брои за {sku}.",
   "Only data from completed orders is shown.": "Показани са само данни от завършени поръчки.",
   "Only data from completed orders is shown. Figures so far.": "Показани са само данни от завършени поръчки. Цифрите са до момента.",
@@ -341,6 +342,7 @@
   "The session's files could not be read": "Файловете на сесията не можаха да се прочетат",
   "The work folder for {list_name} could not be made: {detail}.": "Работната папка за {list_name} не можа да се създаде: {detail}.",
   "There’s already a worker called {name}. Pick that card, or add a surname.": "Вече има работник на име {name}. Изберете тази карта или добавете фамилно име.",
+  "This PC has offline progress that is not synced yet. Reconnect before starting another list.": "Този компютър има офлайн напредък, който още не е синхронизиран. Свържете се отново, преди да започнете друг списък.",
   "This PC has stopped packing it so the two don't overwrite each other's progress. Orders packed here up to now are saved.": "Този компютър спря опаковането, за да не се презаписват взаимно напредъкът на двата. Поръчките, опаковани тук досега, са запазени.",
   "This PC has unsynced progress for {list_name} and the database is unreachable. Reconnect and start the app again to sync it.": "Този компютър има несинхронизиран напредък за {list_name}, а базата данни не е достъпна. Свържете се отново и стартирайте приложението, за да го синхронизирате.",
   "This barcode already maps to": "Този баркод вече е свързан със",
@@ -370,7 +372,6 @@
   "Worker": "Работник",
   "Worker name": "Име на работник",
   "Working · step {step} of 3": "Работи се · стъпка {step} от 3",
-  "You are offline. Finish the open list before starting another.": "Нямате връзка. Завършете отворения списък, преди да започнете друг.",
   "Your {n} change is still here and nothing on the server changed.": [
     "Вашата {n} промяна е още тук и нищо на сървъра не се е променило.",
     "Вашите {n} промени са още тук и нищо на сървъра не се е променило."

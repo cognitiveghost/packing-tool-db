@@ -9,15 +9,22 @@ import base64
 import json
 import os
 import shutil
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from shared.store import FileStore, Store, StoreConflict, StoreError, StoreNotFound
+from shared.stats_manager import STATS_REL
+from shared.store import (
+    SESSION_INFO,
+    FileStore,
+    Store,
+    StoreConflict,
+    StoreError,
+    StoreNotFound,
+)
 
 OUTBOX = "outbox.jsonl"
-STATS_REL = "Stats/global_stats.json"
-SESSION_INFO = "session_info.json"
 
 
 @dataclass
@@ -30,28 +37,54 @@ def _read_outbox(buffer_dir: Path) -> list[dict]:
     path = Path(buffer_dir) / OUTBOX
     if not path.exists():
         return []
-    ops = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        try:
-            ops.append(json.loads(line))
-        except ValueError:
-            break  # a torn last line from a kill mid-append: everything before it is whole
-    return ops
+    # The last item is "" after a whole line, or a torn line from a kill mid-append. A torn
+    # line was never acknowledged, so it is skipped. A bad whole line is damage: say so and
+    # keep the file, rather than drop the ops after it.
+    lines = path.read_text(encoding="utf-8").split("\n")[:-1]
+    try:
+        return [json.loads(line) for line in lines]
+    except ValueError:
+        raise StoreError(f"offline outbox is damaged, kept as is: {path}") from None
+
+
+def _drop_torn_tail(path: Path) -> None:
+    """Cut a torn last line, so the next append starts a line of its own instead of fusing."""
+    if not path.exists():
+        return
+    data = path.read_bytes()
+    keep = data.rfind(b"\n") + 1
+    if keep < len(data):
+        with open(path, "r+b") as f:
+            f.truncate(keep)
+            os.fsync(f.fileno())
 
 
 class BufferedStore(Store):
     def __init__(self, inner: Store, buffer_dir: Path, *, list_dir: str, pc: str):
         self.inner = inner
         self.buffer_dir = Path(buffer_dir)
-        self.list_dir = list_dir
+        self.list_rel = list_dir  # not self.list_dir: that is the Store method below
         self.pc = pc
-        self.online = True
         self.derived_indexes = inner.derived_indexes
         self._state = FileStore(self.buffer_dir / "state")
+        # The heartbeat thread flushes while the UI thread writes: an op appended mid-flush
+        # must never be cleared unpushed.
+        self._mutex = threading.RLock()
         parts = list_dir.split("/")
         self._allowed_exact = {STATS_REL, "/".join(parts[:3] + [SESSION_INFO])}
         self.buffer_dir.mkdir(parents=True, exist_ok=True)
-        self.online = not self._ops()  # a leftover outbox means we have not flushed yet
+        _drop_torn_tail(self.buffer_dir / OUTBOX)
+        ops = self._ops()
+        if ops and ops[0]["list_dir"] != list_dir:
+            # One outbox holds one list: its ops are checked against that list's lock only.
+            raise StoreError(f"offline progress for {ops[0]['list_dir']} is not synced yet")
+        # The outbox is the truth; state/ is its read cache. Rebuild it, so a kill between
+        # the two writes, or a half-done clear, never serves a value the outbox lacks.
+        shutil.rmtree(self.buffer_dir / "state", ignore_errors=True)
+        for op in ops:
+            if op["op"] != "write_bytes":
+                self._state.write_json(op["rel"], op["data"])
+        self.online = not ops  # a leftover outbox means we have not flushed yet
 
     @staticmethod
     def pending(buffer_dir: Path) -> str | None:
@@ -63,26 +96,33 @@ class BufferedStore(Store):
         return _read_outbox(self.buffer_dir)
 
     def _append(self, op: dict) -> None:
-        op["list_dir"] = self.list_dir
-        with open(self.buffer_dir / OUTBOX, "a", encoding="utf-8") as f:
-            f.write(json.dumps(op) + "\n")
-            f.flush()
-            os.fsync(f.fileno())
+        with open(self.buffer_dir / OUTBOX, "ab") as f:
+            start = f.tell()
+            try:
+                f.write((json.dumps(op) + "\n").encode("utf-8"))
+                f.flush()
+                os.fsync(f.fileno())
+            except BaseException:
+                f.truncate(start)  # no half line for the next append to fuse with
+                raise
 
     def _check_allowed(self, rel: str) -> None:
-        if rel not in self._allowed_exact and not rel.startswith(self.list_dir + "/"):
+        if rel not in self._allowed_exact and not rel.startswith(self.list_rel + "/"):
             raise StoreError("offline")
 
     def _buffer(self, op: str, rel: str, data=None, blob: bytes | None = None) -> None:
         self._check_allowed(rel)
-        entry = {"op": op, "rel": rel}
-        if blob is not None:
-            self._state.write_bytes(rel, blob)
-            entry["blob_file"] = rel
-        else:
-            self._state.write_json(rel, data)
-            entry["data"] = data
-        self._append(entry)
+        entry = {"op": op, "rel": rel, "list_dir": self.list_rel}
+        with self._mutex:
+            if blob is not None:
+                self._state.write_bytes(rel, blob)  # the blob exists before an op names it
+                entry["blob_file"] = rel
+                self._append(entry)
+            else:
+                entry["data"] = data
+                self._append(entry)  # the outbox first: a restart rebuilds state/ from it
+                self._state.write_json(rel, data)
+            self.online = False  # flushed on the next heartbeat, even if a flush just ended
 
     def _lost(self, e: StoreError) -> bool:
         """A network-ish failure: flips to offline. Not-found and conflicts are real answers."""
@@ -92,8 +132,11 @@ class BufferedStore(Store):
         return True
 
     # --- reads: buffer first, then inner -----------------------------------
+    def _buffered(self, rel) -> bool:
+        return not self.online and self._state.exists(rel)
+
     def read_json(self, rel):
-        if self._state.exists(rel):
+        if self._buffered(rel):
             return self._state.read_json(rel)
         try:
             return self.inner.read_json(rel)
@@ -102,7 +145,7 @@ class BufferedStore(Store):
             raise
 
     def read_bytes(self, rel):
-        if self._state.exists(rel):
+        if self._buffered(rel):
             return self._state.read_bytes(rel)
         try:
             return self.inner.read_bytes(rel)
@@ -111,45 +154,52 @@ class BufferedStore(Store):
             raise
 
     def exists(self, rel):
-        if self._state.exists(rel):
+        if self._buffered(rel):
             return True
         return self._inner(self.inner.exists, rel)
 
     # --- writes: inner when online and nothing queued, else the outbox -----------
+    # Under the mutex, so a write never lands directly on inner while older ops still wait.
     def write_json(self, rel, data):
-        if self.online:
-            try:
-                return self.inner.write_json(rel, data)
-            except StoreError as e:
-                if not self._lost(e):
-                    raise
-        self._buffer("write_json", rel, data)
+        with self._mutex:
+            if self.online:
+                try:
+                    return self.inner.write_json(rel, data)
+                except StoreError as e:
+                    if not self._lost(e):
+                        raise
+            self._buffer("write_json", rel, data)
 
     def update_json(self, rel, fn):
-        if self.online:
+        with self._mutex:
+            if self.online:
+                try:
+                    return self.inner.update_json(rel, fn)
+                except StoreError as e:
+                    if not self._lost(e):
+                        raise
             try:
-                return self.inner.update_json(rel, fn)
-            except StoreError as e:
-                if not self._lost(e):
-                    raise
-        try:
-            current = self.read_json(rel)
-        except StoreNotFound:
-            current = None
-        except StoreError:
-            raise StoreError("offline") from None  # never fn(None) over a state we could not read
-        result = fn(current)
-        self._buffer("update_json_result", rel, result)
-        return result
+                current = self.read_json(rel)
+            except StoreNotFound:
+                current = None
+            except StoreError:
+                raise StoreError("offline") from None  # never fn(None) over a state we could not read
+            result = fn(current)
+            # ponytail: replayed as a whole-document write, so on a shared doc (stats,
+            # session_info) it is last-writer-wins over other PCs' edits made meanwhile. Offline
+            # it only runs once the doc is buffered; queue deltas if that ever becomes common.
+            self._buffer("update_json_result", rel, result)
+            return result
 
     def write_bytes(self, rel, data):
-        if self.online:
-            try:
-                return self.inner.write_bytes(rel, data)
-            except StoreError as e:
-                if not self._lost(e):
-                    raise
-        self._buffer("write_bytes", rel, blob=data)
+        with self._mutex:
+            if self.online:
+                try:
+                    return self.inner.write_bytes(rel, data)
+                except StoreError as e:
+                    if not self._lost(e):
+                        raise
+            self._buffer("write_bytes", rel, blob=data)
 
     # --- delegated ---------------------------------------------------------
     def _inner(self, fn, *args):
@@ -204,32 +254,33 @@ class BufferedStore(Store):
         shutil.rmtree(self.buffer_dir / "state", ignore_errors=True)
 
     def flush(self) -> FlushResult:
-        ops = self._ops()
-        if not ops:
-            self.online = True
-            return FlushResult(0)
-        try:
-            ours = self.inner.heartbeat_list_lock(self.list_dir, self.pc)
-        except StoreError:
-            self.online = False
-            return FlushResult(0)
-        if not ours:
-            return self._write_conflict(ops)
-        pushed = 0
-        for op in ops:
+        with self._mutex:  # no append between reading the outbox and clearing it
+            ops = self._ops()
+            if not ops:
+                self.online = True
+                return FlushResult(0)
             try:
-                if op["op"] == "write_bytes":
-                    self.inner.write_bytes(op["rel"], self._state.read_bytes(op["blob_file"]))
-                else:
-                    self.inner.write_json(op["rel"], op["data"])
+                ours = self.inner.heartbeat_list_lock(self.list_rel, self.pc)
             except StoreError:
                 self.online = False
-                self._rewrite_outbox(ops[pushed:])
-                return FlushResult(pushed)
-            pushed += 1
-        self._clear()
-        self.online = True
-        return FlushResult(pushed)
+                return FlushResult(0)
+            if not ours:
+                return self._write_conflict(ops)
+            pushed = 0
+            for op in ops:
+                try:
+                    if op["op"] == "write_bytes":
+                        self.inner.write_bytes(op["rel"], self._state.read_bytes(op["blob_file"]))
+                    else:
+                        self.inner.write_json(op["rel"], op["data"])
+                except StoreError:
+                    self.online = False
+                    self._rewrite_outbox(ops[pushed:])
+                    return FlushResult(pushed)
+                pushed += 1
+            self._clear()
+            self.online = True
+            return FlushResult(pushed)
 
     def _rewrite_outbox(self, ops: list[dict]) -> None:
         tmp = self.buffer_dir / (OUTBOX + ".tmp")
@@ -249,7 +300,7 @@ class BufferedStore(Store):
             else:
                 state[op["rel"]] = op["data"]
         stamp = datetime.now().strftime("%Y%m%d%H%M%S")
-        rel = f"{self.list_dir}/packing_state_conflict_{self.pc}_{stamp}.json"
+        rel = f"{self.list_rel}/packing_state_conflict_{self.pc}_{stamp}.json"
         try:
             self.inner.write_json(rel, {"pc": self.pc, "state": state, "blobs_b64": blobs})
         except StoreError:

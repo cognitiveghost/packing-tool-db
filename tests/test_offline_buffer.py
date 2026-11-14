@@ -1,4 +1,7 @@
 """BufferedStore: durable outbox, order, conflict copies (plan Task 11, review focus #1)."""
+import threading
+import time
+
 import pytest
 
 from packing_tool.offline_buffer import BufferedStore
@@ -170,3 +173,74 @@ def test_finish_list_offline_queues_summary_and_stats(inner, tmp_path):
     assert inner.read_json(INFO) == {"status": "packed"}
     assert inner.read_json(STATS) == {"orders": 1}
     assert inner.read_bytes(f"{LIST}/report.bin") == b"\x00\x01"
+
+
+def test_list_dir_is_still_the_store_method(inner, tmp_path):
+    inner.write_json(STATE, {"n": 1})
+    assert "packing_state.json" in make(inner, tmp_path).list_dir(LIST)
+
+
+def test_append_after_torn_tail_keeps_later_writes(inner, tmp_path):
+    b = make(inner, tmp_path)
+    inner.down = True
+    b.write_json(STATE, {"n": 1})
+    with open(tmp_path / "buf" / "outbox.jsonl", "a", encoding="utf-8") as f:
+        f.write('{"op": "write_js')  # killed mid-append
+    b2 = make(inner, tmp_path)  # restarted, still offline
+    b2.write_json(STATE, {"n": 2})
+    b2.write_json(STATE, {"n": 3})
+    inner.down = False
+    assert b2.flush().pushed == 3
+    assert inner.read_json(STATE) == {"n": 3}
+
+
+def test_damaged_middle_line_is_kept_not_cleared(inner, tmp_path):
+    b = make(inner, tmp_path)
+    inner.down = True
+    b.write_json(STATE, {"n": 1})
+    outbox = tmp_path / "buf" / "outbox.jsonl"
+    outbox.write_text(outbox.read_text() + "garbage\n", encoding="utf-8")
+    with pytest.raises(StoreError, match="damaged"):
+        b.flush()
+    assert "garbage" in outbox.read_text()
+
+
+def test_stale_state_without_outbox_is_not_served(inner, tmp_path):
+    b = make(inner, tmp_path)
+    inner.down = True
+    b.write_json(STATE, {"n": 9})
+    (tmp_path / "buf" / "outbox.jsonl").unlink()  # killed half way through a clear
+    inner.down = False
+    inner.write_json(STATE, {"n": 100})
+    assert make(inner, tmp_path).read_json(STATE) == {"n": 100}
+
+
+def test_write_during_flush_is_not_lost(inner, tmp_path):
+    b = make(inner, tmp_path)
+    inner.down = True
+    b.write_json(STATE, {"n": 1})
+    inner.down = False
+    writer = threading.Thread(target=b.write_json, args=(STATE, {"n": 2}))
+    real = inner.write_json
+
+    def write_while_ui_writes(rel, data):
+        if writer.ident is None:
+            writer.start()  # the UI thread writes while the heartbeat thread flushes
+            time.sleep(0.05)
+        real(rel, data)
+
+    inner.write_json = write_while_ui_writes
+    b.flush()
+    writer.join()
+    inner.write_json = real
+    b.flush()
+    assert inner.read_json(STATE) == {"n": 2}
+    assert BufferedStore.pending(tmp_path / "buf") is None
+
+
+def test_second_list_refused_while_outbox_pending(inner, tmp_path):
+    b = make(inner, tmp_path)
+    inner.down = True
+    b.write_json(STATE, {"n": 1})
+    with pytest.raises(StoreError, match="not synced"):
+        BufferedStore(inner, tmp_path / "buf", list_dir=LIST.replace("DHL", "UPS"), pc="PC1")

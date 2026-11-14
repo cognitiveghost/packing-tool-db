@@ -83,6 +83,7 @@ from shared.server_connection import (
 )
 from shared.session_id import derive_session_id
 from shared.stats_manager import StatsManager
+from shared.store import StoreError
 from shared.store_mode import Mode, open_store
 from shared.store_supabase import SupabaseStore
 from shared.theme import (
@@ -1020,8 +1021,8 @@ class MainWindow(QMainWindow):
             outbox_pending=pending is not None,
         )
         if mode is Mode.SUPABASE:
-            if pending:
-                self._flush_pending_outbox(store, buffer_dir, pending)
+            if pending and not self._sync_offline_outbox(store, socket.gethostname()):
+                logger.warning(f"Offline progress for {pending} is still unsynced; retried when a list starts")
             return ProfileManager(config_path, store=store)
         if mode is Mode.OFFLINE_BUFFER:
             # Never the file share: that progress belongs to the database. Reconnect to sync it.
@@ -1034,16 +1035,34 @@ class MainWindow(QMainWindow):
             )
         return ProfileManager(config_path)
 
-    def _flush_pending_outbox(self, store, buffer_dir: Path, list_dir: str):
-        res = BufferedStore(store, buffer_dir, list_dir=list_dir, pc=socket.gethostname()).flush()
-        if res.conflict_rel:
-            self._startup_conflict = res.conflict_rel
-            logger.error(f"Offline progress conflicted with another PC; saved as {res.conflict_rel}")
+    def _sync_offline_outbox(self, store, pc: str) -> bool:
+        """Push the offline outbox, whichever run or list left it. True when nothing is unsynced."""
+        if _use_file_store():
+            return True
+        buffer_dir = _offline_buffer_dir()
+        try:
+            if not isinstance(store, BufferedStore):
+                pending = BufferedStore.pending(buffer_dir)
+                if pending is None:
+                    return True
+                if not isinstance(store, SupabaseStore):
+                    return False
+                store = BufferedStore(store, buffer_dir, list_dir=pending, pc=pc)
+            res = store.flush()
+            if res.conflict_rel:
+                self._on_offline_conflict(res.conflict_rel)
+            return BufferedStore.pending(buffer_dir) is None
+        except StoreError:
+            logger.exception("Offline outbox could not be synced")
+            return False
 
     def _on_offline_conflict(self, rel: str):
-        self._toast(
+        """Persistent, not a toast: the packer has to find that file later."""
+        logger.error(f"Offline progress conflicted with another PC; saved as {rel}")
+        QMessageBox.warning(
+            self,
+            _("Offline progress kept aside"),
             _("Another PC took this list while you were offline. Your progress is saved as {file}.", file=rel),
-            role="error",
         )
 
     def _wrap_store_for_list(self, work_dir: Path):
@@ -1054,7 +1073,7 @@ class MainWindow(QMainWindow):
             return
         list_dir = Path(work_dir).relative_to(pm.store.local_path("")).as_posix()
         pm.store = BufferedStore(
-            pm.store, _offline_buffer_dir(), list_dir=list_dir, pc=socket.gethostname()
+            pm.store, _offline_buffer_dir(), list_dir=list_dir, pc=self.lock_manager.hostname
         )
 
     def _unwrap_store(self):
@@ -2332,9 +2351,11 @@ class MainWindow(QMainWindow):
         (the "start packing" case); otherwise the existing work_dir is reused (resume).
         take_over is the stale lock the packer agreed to take over, or None.
         """
-        buffered = self.profile_manager.store
-        if isinstance(buffered, BufferedStore) and not buffered.online:
-            self._toast(_("You are offline. Finish the open list before starting another."), role="error")
+        if not self._sync_offline_outbox(self.profile_manager.store, self.lock_manager.hostname):
+            self._toast(
+                _("This PC has offline progress that is not synced yet. Reconnect before starting another list."),
+                role="error",
+            )
             return
         if self._starting:
             return
