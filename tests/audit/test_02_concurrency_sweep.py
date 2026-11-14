@@ -17,7 +17,7 @@ from packing_tool.profile_manager import ProfileManager, ProfileManagerError
 from packing_tool.session_lock_manager import SessionLockManager
 from packing_tool.session_registry_manager import SessionRegistryManager
 from packing_tool.worker_manager import WorkerManager
-from shared.store import FileStore
+from shared.store import FileStore, StoreError
 
 
 def _lock(work_dir: Path, by: str, age_seconds: int, pid: int = 1):
@@ -172,21 +172,21 @@ def test_a_failed_registry_read_does_not_wipe_it(profile_manager, monkeypatch):
     for n in range(3):
         reg.register_session_start("M", f"s{n}", "L", None, None, "PC", 1, 1, "w", "p")
 
-    real_open = open
-    path = str(reg._get_registry_path("M"))
+    store = profile_manager.store
+    real_read = store.read_json
     failed = []
 
-    def flaky_open(file, *a, **k):
-        if str(file) == path and not failed and "r" in (a[0] if a else k.get("mode", "r")):
+    def flaky_read(rel):
+        if rel.endswith("registry_index.json") and not failed:
             failed.append(True)
-            raise PermissionError(13, "sharing violation")
-        return real_open(file, *a, **k)
+            raise StoreError(rel)  # a sharing violation on the registry read
+        return real_read(rel)
 
-    monkeypatch.setattr("builtins.open", flaky_open)
-    reg.register_session_start("M", "s9", "L", None, None, "PC", 1, 1, "w", "p")
+    monkeypatch.setattr(store, "read_json", flaky_read)
+    assert reg.register_session_start("M", "s9", "L", None, None, "PC", 1, 1, "w", "p") is False
     monkeypatch.undo()
 
-    assert len(reg.read_registry("M")["sessions"]) == 4
+    assert len(reg.read_registry("M")["sessions"]) == 3
 
 
 # ---------------------------------------------------------------------------

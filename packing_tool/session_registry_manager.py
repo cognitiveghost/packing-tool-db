@@ -1,7 +1,7 @@
 """
 Session Registry Manager - Per-client index for fast session browser loading.
 
-Maintains a registry_index.json per client at:
+File mode (FileStore) maintains a registry_index.json per client at:
     Sessions/CLIENT_{id}/registry_index.json
 
 This eliminates the need to scan thousands of session directories over the
@@ -9,7 +9,11 @@ network file server. Instead of a 15-20 minute scan, the browser reads a
 single file per client and resolves only active session lock files to check
 heartbeat freshness (typically just a few files).
 
-Update triggers:
+Derived mode (SupabaseStore, store.derived_indexes) stores nothing: the
+registry is computed by a scan of the client's folder on each read, and the
+register_* / refresh calls do nothing.
+
+Update triggers (file mode):
     - register_session_start()   → session is in_progress
     - register_session_complete() → session is completed / incomplete
     - register_session_paused()  → session is paused
@@ -17,24 +21,18 @@ Update triggers:
     - ensure_registry()          → first-run migration scan (one time per client)
 
 Design notes:
-    - Atomic writes (temp file + rename) prevent partial writes on network drives
+    - Every read-modify-write goes through Store.update_json (locked, atomic)
     - All registry methods are synchronous; the browser calls them on a background
       thread via RegistryRefreshWorker to keep UI responsive
     - Status values stored in registry: in_progress, paused, completed, incomplete
     - Browser adds stale / abandoned labels at display time (derived from timestamps)
 """
 
-import json
 import logging
 import os
-import time
-from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
-from packing_tool.session_lock_manager import SessionLockManager
-from shared.atomic_write import atomic_write_json
-from shared.file_lock import FileLockError, locked_file
 from shared.metadata_utils import get_current_timestamp, parse_timestamp
 from shared.store import Store, StoreError, StoreNotFound
 
@@ -48,9 +46,9 @@ STALE_HEARTBEAT_SECONDS = 120
 # Seconds before a session with no summary and no recent activity is "abandoned"
 ABANDONED_SECONDS = 86400  # 24 hours
 
-# A read inside a locked update is retried before it gives up (AUDIT-02-5)
-REGISTRY_READ_ATTEMPTS = 3
-REGISTRY_READ_RETRY_SECONDS = 0.2
+
+class _Unchanged(Exception):
+    """Raised inside a registry update to end it without writing the file."""
 
 
 def _rel(store: Store, path) -> str:
@@ -73,7 +71,7 @@ class SessionRegistryManager:
     def __init__(self, profile_manager):
         """
         Args:
-            profile_manager: ProfileManager instance (uses get_sessions_root()).
+            profile_manager: ProfileManager instance (uses its store).
         """
         self.profile_manager = profile_manager
 
@@ -81,11 +79,9 @@ class SessionRegistryManager:
     #  Internal helpers                                                    #
     # ------------------------------------------------------------------ #
 
-    def _get_registry_path(self, client_id: str) -> Path:
-        """Return path to registry_index.json for the given client."""
-        return self.profile_manager.store.local_path(
-            f"Sessions/CLIENT_{client_id}/{self.REGISTRY_FILENAME}"
-        )
+    def _registry_rel(self, client_id: str) -> str:
+        """Store path of registry_index.json for the given client."""
+        return f"Sessions/CLIENT_{client_id}/{self.REGISTRY_FILENAME}"
 
     def _empty_registry(self, client_id: str) -> dict:
         """Return an empty, versioned registry structure."""
@@ -102,97 +98,84 @@ class SessionRegistryManager:
         """Composite dict key: '{session_id}::{packing_list_name}'."""
         return f"{session_id}::{packing_list_name}"
 
-    @contextmanager
-    def _locked(self, client_id: str):
-        """Hold the registry's sidecar lock for one read-modify-write (spec D3).
+    def _usable(self, client_id: str, data) -> dict:
+        """The stored registry, or an empty one when its version is not the one this code reads."""
+        if isinstance(data, dict) and data.get("version") == self.REGISTRY_VERSION:
+            return data
+        logger.warning(f"Registry for client {client_id} has unexpected version/format, using empty.")
+        return self._empty_registry(client_id)
 
-        Every PC writes this one file; without the lock two writers each
-        drop the other's change, and a dropped entry re-lists a finished
-        packing list as not started.
+    def _update(self, client_id: str, change) -> bool:
+        """Read-modify-write the registry under the store's lock (spec D3).
+
+        Every PC writes this one file; without the lock two writers each drop
+        the other's change. `change(registry)` edits the registry in place and
+        returns True to save it, or False to leave the file untouched. Derived
+        mode has no file to change: nothing is written and this returns True.
+        A failed read or write returns False and writes nothing.
         """
-        path = self._get_registry_path(client_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path.with_name(path.name + ".lock"), "a+") as handle, locked_file(handle):  # store-guard: allow registry_index.json
-            yield
+        store = self.profile_manager.store
+        if store.derived_indexes:
+            return True
+
+        def apply(current):
+            registry = self._empty_registry(client_id) if current is None else self._usable(client_id, current)
+            if not change(registry):
+                raise _Unchanged()
+            registry["last_updated"] = get_current_timestamp()
+            return registry
+
+        try:
+            store.update_json(self._registry_rel(client_id), apply)
+            return True
+        except _Unchanged:
+            return False
+        except StoreError:
+            logger.exception(f"Failed to read or write registry for client {client_id}")
+            return False
 
     # ------------------------------------------------------------------ #
     #  Read / Write                                                        #
     # ------------------------------------------------------------------ #
 
-    def _load(self, client_id: str):
-        """registry_index.json as parsed JSON. StoreNotFound if absent, StoreError if unreadable."""
-        path = self._get_registry_path(client_id)
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except FileNotFoundError:
-            raise StoreNotFound(str(path)) from None
-        except (OSError, ValueError) as e:  # ValueError covers JSONDecodeError
-            raise StoreError(str(e)) from e
-
     def read_registry(self, client_id: str) -> dict:
         """
-        Load registry from disk.
+        The client's registry.
 
-        A missing file is an empty registry. A file that cannot be read raises
-        StoreError: an empty registry there reads as "no sessions" during an outage.
-        A readable file in an unexpected format is still an empty registry.
+        Derived mode: computed by a scan of the client's folder. A failed read
+        raises StoreError: an empty registry there reads as "no sessions" during an outage.
+
+        File mode: registry_index.json. A missing file is an empty registry; a
+        file that cannot be read raises StoreError; a readable file in an
+        unexpected format is still an empty registry.
         """
+        store = self.profile_manager.store
+        if store.derived_indexes:
+            return self.build_from_scan(client_id)
         try:
-            data = self._load(client_id)
+            data = store.read_json(self._registry_rel(client_id))
         except StoreNotFound:
             return self._empty_registry(client_id)
-        if isinstance(data, dict) and data.get("version") == self.REGISTRY_VERSION:
-            return data
-        logger.warning(f"Registry for client {client_id} has unexpected version/format, using empty.")
-        return self._empty_registry(client_id)
-
-    def _read_for_update(self, client_id: str) -> dict:
-        """read_registry() for a locked read-modify-write.
-
-        Retries a failed read, then raises: an empty registry returned here would
-        be written back over every entry (AUDIT-02-5). Missing means empty.
-        """
-        path = self._get_registry_path(client_id)
-        for attempt in range(REGISTRY_READ_ATTEMPTS):
-            try:
-                if not path.exists():
-                    return self._empty_registry(client_id)
-                with open(path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                break
-            except (OSError, ValueError) as e:
-                if attempt == REGISTRY_READ_ATTEMPTS - 1:
-                    raise OSError(f"Registry for client {client_id} could not be read: {e}") from e
-                time.sleep(REGISTRY_READ_RETRY_SECONDS)
-        if isinstance(data, dict) and data.get("version") == self.REGISTRY_VERSION:
-            return data
-        logger.warning(f"Registry for client {client_id} has unexpected version/format, using empty.")
-        return self._empty_registry(client_id)
+        return self._usable(client_id, data)
 
     def write_registry(self, client_id: str, registry: dict) -> bool:
         """
-        Atomically write registry to disk (temp file + rename).
+        Write the whole registry (stamps last_updated).
 
-        Updates registry['last_updated'] before writing.
-        Retries up to 3 times with 150 ms backoff to tolerate transient SMB errors.
         Returns True on success, False on failure.
         """
-        path = self._get_registry_path(client_id)
         registry["last_updated"] = get_current_timestamp()
-
         try:
-            atomic_write_json(path, registry, indent=2, ensure_ascii=False)  # store-guard: allow registry_index.json
+            self.profile_manager.store.write_json(self._registry_rel(client_id), registry)
             return True
         except Exception:
-            logger.exception(
-                f"Failed to write registry for client {client_id} after 3 attempts"
-            )
+            logger.exception(f"Failed to write registry for client {client_id}")
             return False
 
     def registry_exists(self, client_id: str) -> bool:
-        """Return True if registry_index.json already exists for this client."""
-        return self._get_registry_path(client_id).exists()
+        """Return True if registry_index.json already exists for this client (always True in derived mode)."""
+        store = self.profile_manager.store
+        return store.derived_indexes or store.exists(self._registry_rel(client_id))
 
     # ------------------------------------------------------------------ #
     #  First-run migration                                                 #
@@ -213,12 +196,20 @@ class SessionRegistryManager:
         logger.info(
             f"No registry for client {client_id} — building from directory scan..."
         )
+        store = self.profile_manager.store
         try:
             registry = self.build_from_scan(client_id)  # slow: kept outside the lock
-            with self._locked(client_id):
-                if self.registry_exists(client_id):  # another PC finished first
-                    return True
-                return self.write_registry(client_id, registry)
+
+            def write_if_absent(current):
+                if current is not None:  # another PC finished first
+                    raise _Unchanged()
+                registry["last_updated"] = get_current_timestamp()
+                return registry
+
+            store.update_json(self._registry_rel(client_id), write_if_absent)
+            return True
+        except _Unchanged:
+            return True
         except Exception:
             logger.exception(
                 f"Failed to build registry for client {client_id}"
@@ -229,9 +220,8 @@ class SessionRegistryManager:
         """
         Walk the Sessions/CLIENT_{id}/ directory tree and build a registry.
 
-        This is intentionally a full scan — it is only called once per client
-        as a migration step when no registry_index.json exists.  After this,
-        all updates go through the targeted mutation methods.
+        In file mode this is only called once per client as a migration step
+        when no registry_index.json exists. In derived mode it runs on every read.
         """
         registry = self._empty_registry(client_id)
         store = self.profile_manager.store
@@ -252,6 +242,8 @@ class SessionRegistryManager:
                     registry, client_id, name, store.local_path(f"{client_rel}/{name}")
                 )
 
+        except StoreError:
+            raise  # a failed listing is not an empty folder: it must not be read as one
         except Exception:
             logger.exception(f"Error scanning {store.local_path(client_rel)}")
 
@@ -333,8 +325,6 @@ class SessionRegistryManager:
         # Prefer summary (completed) over state file (in-progress / paused)
         summary_rel = f"{work_rel}/session_summary.json"
         state_rel = f"{work_rel}/packing_state.json"
-        # MainWindow locks the work folder (packing/<list>/), not the session folder.
-        lock_rel = f"{work_rel}/{SessionLockManager.LOCK_FILENAME}"
         info_rel = f"{_rel(store, session_dir)}/session_info.json"
         pc_name = os.environ.get("COMPUTERNAME", "Unknown")
 
@@ -381,7 +371,8 @@ class SessionRegistryManager:
                 state = store.read_json(state_rel)
                 progress = state.get("progress", {})
 
-                if store.exists(lock_rel):
+                # MainWindow locks the work folder (packing/<list>/), not the session folder.
+                if store.lock_info(work_rel) is not None:
                     status = "in_progress"
                 elif store.exists(info_rel):
                     status = "paused"
@@ -410,6 +401,16 @@ class SessionRegistryManager:
             except Exception as e:
                 logger.debug(f"Could not read state {state_rel}: {e}")
 
+    def _mtime(self, pl_file: Path) -> float | None:
+        """Change key refresh_available_lists compares: seconds in file mode, None when derived.
+
+        Taken from the store's stamp, not a stat. FileStore's stamp is (mtime_ns, size).
+        """
+        store = self.profile_manager.store
+        if store.derived_indexes:
+            return None
+        return store.stamp(_rel(store, pl_file))[0] / 1e9
+
     def _register_available_from_file(
         self,
         registry: dict,
@@ -422,8 +423,7 @@ class SessionRegistryManager:
         key = self._session_key(session_id, packing_list_name)
         store = self.profile_manager.store
         try:
-            # Raw stat, not a read: the float mtime is the change key refresh_available_lists compares.
-            mtime = pl_file.stat().st_mtime  # before the read: a rewrite mid-read is re-read next time
+            mtime = self._mtime(pl_file)  # before the read: a rewrite mid-read is re-read next time
             pl_data = store.read_json(_rel(store, pl_file))
             # Courier may be under different keys depending on Shopify tool version
             courier = (
@@ -473,8 +473,7 @@ class SessionRegistryManager:
 
         Also removes the packing list from available_lists (it has now been started).
         """
-        with self._locked(client_id):
-            registry = self._read_for_update(client_id)
+        def change(registry):
             key = self._session_key(session_id, packing_list_name)
             now = get_current_timestamp()
             existing = registry["sessions"].get(key, {})
@@ -500,10 +499,10 @@ class SessionRegistryManager:
             }
 
             # Remove the matching available_list entry (same session_id + list_name)
-            al_key = self._session_key(session_id, packing_list_name)
-            registry["available_lists"].pop(al_key, None)
+            registry["available_lists"].pop(key, None)
+            return True
 
-            return self.write_registry(client_id, registry)
+        return self._update(client_id, change)
 
     def register_session_complete(
         self,
@@ -516,8 +515,7 @@ class SessionRegistryManager:
         Mark a session as 'completed' or 'incomplete' using data from
         session_summary.json.
         """
-        with self._locked(client_id):
-            registry = self._read_for_update(client_id)
+        def change(registry):
             key = self._session_key(session_id, packing_list_name)
 
             # Create a stub entry if it somehow isn't in the registry yet
@@ -552,7 +550,9 @@ class SessionRegistryManager:
                     "metrics": summary.get("metrics"),
                 }
             )
-            return self.write_registry(client_id, registry)
+            return True
+
+        return self._update(client_id, change)
 
     def register_session_paused(
         self,
@@ -564,17 +564,15 @@ class SessionRegistryManager:
         Mark a session as 'paused' (worker stepped away without completing).
         Only updates status if the entry exists and is not already completed.
         """
-        with self._locked(client_id):
-            registry = self._read_for_update(client_id)
-            key = self._session_key(session_id, packing_list_name)
+        def change(registry):
+            entry = registry["sessions"].get(self._session_key(session_id, packing_list_name))
+            if entry is None or entry.get("status", "") in ("completed", "incomplete"):
+                return False
+            entry["status"] = "paused"
+            entry["last_updated"] = get_current_timestamp()
+            return True
 
-            if key in registry["sessions"]:
-                current_status = registry["sessions"][key].get("status", "")
-                if current_status not in ("completed", "incomplete"):
-                    registry["sessions"][key]["status"] = "paused"
-                    registry["sessions"][key]["last_updated"] = get_current_timestamp()
-                    return self.write_registry(client_id, registry)
-            return False
+        return self._update(client_id, change)
 
     def update_session_progress(
         self,
@@ -589,8 +587,7 @@ class SessionRegistryManager:
         A finished entry (completed/incomplete) is left alone: its counts
         came from the session summary and are final.
         """
-        with self._locked(client_id):
-            registry = self._read_for_update(client_id)
+        def change(registry):
             entry = registry["sessions"].get(self._session_key(session_id, packing_list_name))
             if entry is None or entry.get("status") in ("completed", "incomplete"):
                 return False
@@ -601,7 +598,9 @@ class SessionRegistryManager:
                     "last_updated": get_current_timestamp(),
                 }
             )
-            return self.write_registry(client_id, registry)
+            return True
+
+        return self._update(client_id, change)
 
     def register_available_list(
         self,
@@ -618,8 +617,7 @@ class SessionRegistryManager:
         Called when the Session Browser detects a new packing list JSON on the
         server that is not yet represented in the registry.
         """
-        with self._locked(client_id):
-            registry = self._read_for_update(client_id)
+        def change(registry):
             key = self._session_key(session_id, packing_list_name)
 
             # Don't add to available_lists if a session already exists for this key
@@ -637,7 +635,9 @@ class SessionRegistryManager:
                 "total_orders": metadata.get("total_orders", 0),
                 "total_items": metadata.get("total_items", 0),
             }
-            return self.write_registry(client_id, registry)
+            return True
+
+        return self._update(client_id, change)
 
     # ------------------------------------------------------------------ #
     #  Read accessors                                                      #
@@ -721,24 +721,17 @@ class SessionRegistryManager:
 
     def _get_lock_heartbeat_age(self, lock_dir: str) -> float | None:
         """
-        Read the work folder's .session.lock and return seconds since last heartbeat.
-        Returns None if the file cannot be read or parsed (a missing lock included).
+        Seconds since the work folder's list lock was last heartbeat.
+        Returns None if there is no lock, it cannot be read, or it has no heartbeat.
         """
         try:
             store = self.profile_manager.store
-            lock_data = store.read_json(f"{_rel(store, lock_dir)}/{SessionLockManager.LOCK_FILENAME}")
-            heartbeat_str = lock_data.get("heartbeat") or lock_data.get("lock_time")
-            if not heartbeat_str:
-                return None
-            heartbeat = parse_timestamp(heartbeat_str)
-            if heartbeat is None:
-                return None
-            age = (
-                datetime.now(UTC) - heartbeat.astimezone(UTC)
-            ).total_seconds()
-            return age
+            info = store.lock_info(_rel(store, lock_dir))
         except Exception:
             return None
+        if info is None or info.heartbeat_at is None:
+            return None
+        return (datetime.now(UTC) - info.heartbeat_at.astimezone(UTC)).total_seconds()
 
     # ------------------------------------------------------------------ #
     #  Incremental available-list discovery                               #
@@ -753,10 +746,13 @@ class SessionRegistryManager:
         lists (`sessions`) are never re-read here.
 
         Returns the number of entries added or replaced (removals are not counted).
+        Derived mode computes the available lists on read, so this does nothing and returns 0.
         """
+        store = self.profile_manager.store
+        if store.derived_indexes:
+            return 0
         registry = self.read_registry(client_id)  # snapshot, only to decide what to re-read
         found = self._empty_registry(client_id)  # what the scan turns up; merged under the lock
-        store = self.profile_manager.store
         client_rel = f"Sessions/CLIENT_{client_id}"
         if not store.exists(client_rel):
             return 0
@@ -789,8 +785,7 @@ class SessionRegistryManager:
                         self._register_from_work_dir(
                             found, session_id, pl_name, work_dir, session_dir
                         )
-                    # Raw stat, not a read: the float mtime is the change key stored in the registry.
-                    elif key not in available or available[key].get("mtime") != pl_file.stat().st_mtime:
+                    elif key not in available or available[key].get("mtime") != self._mtime(pl_file):
                         self._register_available_from_file(
                             found, session_id, pl_name, pl_file, session_dir
                         )
@@ -808,26 +803,24 @@ class SessionRegistryManager:
             return 0
 
         new_count = 0
-        try:
-            with self._locked(client_id):
-                current = self._read_for_update(client_id)
-                for key, entry in found["sessions"].items():
-                    if key in current["sessions"]:
-                        continue  # another PC registered it while we scanned
-                    current["available_lists"].pop(key, None)  # started now
-                    current["sessions"][key] = entry
-                    new_count += 1
-                for key, entry in found["available_lists"].items():
-                    if key in current["sessions"]:
-                        continue
-                    current["available_lists"][key] = entry  # new, or replaces a stale copy
-                    new_count += 1
-                for key in gone:
-                    current["available_lists"].pop(key, None)
-                if new_count or gone:
-                    self.write_registry(client_id, current)
-        except FileLockError:
-            logger.warning("Registry busy; new lists will merge on the next refresh")
-            return 0
 
+        def merge(current):
+            nonlocal new_count
+            for key, entry in found["sessions"].items():
+                if key in current["sessions"]:
+                    continue  # another PC registered it while we scanned
+                current["available_lists"].pop(key, None)  # started now
+                current["sessions"][key] = entry
+                new_count += 1
+            for key, entry in found["available_lists"].items():
+                if key in current["sessions"]:
+                    continue
+                current["available_lists"][key] = entry  # new, or replaces a stale copy
+                new_count += 1
+            for key in gone:
+                current["available_lists"].pop(key, None)
+            return bool(new_count or gone)
+
+        if not self._update(client_id, merge):
+            return 0
         return new_count
