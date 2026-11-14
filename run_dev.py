@@ -2,6 +2,7 @@
 used by shopify-fulfillment-tool (sibling repo), instead of the production
 network share in config.ini.
 """
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -39,5 +40,6 @@ if __name__ == "__main__":
     result = subprocess.run(
         [sys.executable, str(ROOT / "main.py"), "--config", str(CONFIG_DEV)],
         check=False,
+        env={**os.environ, "FULFILLMENT_STORE_MODE": "file"},  # the dev server is a file share
     )
     sys.exit(result.returncode)
