@@ -16,7 +16,7 @@ from pathlib import Path
 
 from shared.logger import setup_logging
 from shared.server_connection import resolve_server_path, test_path_reachable
-from shared.store import FileStore, StoreError
+from shared.store import FileStore, Store, StoreError
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +31,22 @@ class NetworkError(ProfileManagerError):
 
 class ValidationError(ProfileManagerError):
     """Raised when validation fails."""
+
+
+def resolve_file_server_path(config: configparser.ConfigParser) -> str:
+    """The file share root: FULFILLMENT_SERVER_PATH, then the saved connection, then config.ini.
+
+    The env var is the same one shopify-fulfillment-tool's ProfileManager uses, so
+    both apps can be pointed at the same file server from one place.
+    """
+    config_fallback = config.get('Network', 'FileServerPath', fallback=None)
+    file_server_path = resolve_server_path("PackingTool-DB", "FULFILLMENT_SERVER_PATH", config_fallback)
+    if not file_server_path:
+        raise ProfileManagerError(
+            "FileServerPath not configured: set FULFILLMENT_SERVER_PATH, "
+            "use Settings → Server Connection, or add FileServerPath to config.ini"
+        )
+    return file_server_path
 
 
 class ProfileManager:
@@ -55,12 +71,14 @@ class ProfileManager:
 
     CACHE_TIMEOUT_SECONDS = 60  # Cache valid for 1 minute
 
-    def __init__(self, config_path: str = "config.ini"):
+    def __init__(self, config_path: str = "config.ini", store: Store | None = None):
         """
         Initialize ProfileManager with configuration.
 
         Args:
             config_path: Path to config.ini file
+            store: A Store already opened by the caller; used as is. Without one,
+                the file share is resolved from config and probed.
 
         Raises:
             ProfileManagerError: If configuration is invalid or inaccessible
@@ -76,23 +94,14 @@ class ProfileManager:
         # Load configuration
         self.config = self._load_config(config_path)
 
-        # Get paths from config — resolve_server_path checks, in order:
-        # FULFILLMENT_SERVER_PATH env var (same variable, same precedence
-        # shopify-fulfillment-tool's ProfileManager already uses, so both
-        # apps can be pointed at the same file server from one place), then
-        # a path saved via the Server Connection UI, then config.ini.
-        config_fallback = self.config.get('Network', 'FileServerPath', fallback=None)
-        file_server_path = resolve_server_path(
-            "PackingTool-DB", "FULFILLMENT_SERVER_PATH", config_fallback
-        )
-        if not file_server_path:
-            raise ProfileManagerError(
-                "FileServerPath not configured: set FULFILLMENT_SERVER_PATH, "
-                "use Settings → Server Connection, or add FileServerPath to config.ini"
-            )
+        # A store the caller already opened (startup chose the backend) is used
+        # as is: no server-path resolution, no reachability probe.
+        injected = store is not None
+        if not injected:
+            store = FileStore(resolve_file_server_path(self.config))
 
-        self.store = FileStore(file_server_path)
-        self.base_path = self.store.root
+        self.store = store
+        self.base_path = self.store.local_path("")
         self.clients_dir = self.store.local_path("Clients")
         self.sessions_dir = self.store.local_path("Sessions")
         self.workers_dir = self.store.local_path("Workers")
@@ -122,7 +131,7 @@ class ProfileManager:
         self.connection_timeout = self.config.getint('Network', 'ConnectionTimeout', fallback=5)
 
         # Test network connectivity
-        self.is_network_available = test_path_reachable(
+        self.is_network_available = injected or test_path_reachable(
             str(self.base_path), self.connection_timeout
         )
 

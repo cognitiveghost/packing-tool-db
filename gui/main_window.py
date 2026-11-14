@@ -56,13 +56,19 @@ from gui.setup_payload import order_choices, quick_payload
 from gui.theme import apply_theme, current_tokens
 from gui.workers import SessionEndWorker, SessionStartWorker
 from packing_tool import APP_NAME, __version__
-from packing_tool.profile_manager import NetworkError, ProfileManager
+from packing_tool.profile_manager import (
+    NetworkError,
+    ProfileManager,
+    ProfileManagerError,
+    resolve_file_server_path,
+)
 from packing_tool.progress_publisher import ProgressPublisher
 from packing_tool.session_lock_manager import SessionLockManager
 from packing_tool.session_manager import SessionManager
 from packing_tool.session_registry_manager import SessionRegistryManager
 from packing_tool.worker_manager import WorkerManager
 from shared.components.language_segment import switch_language
+from shared.components.sign_in_dialog import SignInDialog
 from shared.components.toast import toast
 from shared.fonts import load_bundled_fonts
 from shared.guide.help import open_guide
@@ -75,6 +81,7 @@ from shared.server_connection import (
 )
 from shared.session_id import derive_session_id
 from shared.stats_manager import StatsManager
+from shared.store_mode import Mode, open_store
 from shared.theme import (
     theme_notifier,
     themed_tokens,
@@ -146,6 +153,11 @@ def _under_pytest() -> bool:
     return "pytest" in sys.modules
 
 
+def _use_file_store() -> bool:
+    """The file share only (no Supabase sign-in): FULFILLMENT_STORE_MODE=file, or a test run."""
+    return os.environ.get("FULFILLMENT_STORE_MODE", "").strip().lower() == "file" or _under_pytest()
+
+
 class MainWindow(QMainWindow):
     """
     The main application window, acting as the central orchestrator.
@@ -198,7 +210,7 @@ class MainWindow(QMainWindow):
         # NetworkError instead of exiting immediately.
         while True:
             try:
-                self.profile_manager = ProfileManager(config_path)
+                self.profile_manager = self._open_profile_manager(config_path)
                 logger.info("ProfileManager initialized successfully")
                 logger.info("%s %s", APP_NAME, __version__)
                 break
@@ -970,6 +982,28 @@ class MainWindow(QMainWindow):
         current = getattr(self, "current_work_dir", None)
         if self.logic and current and Path(current) == Path(work_dir):
             self._on_lock_lost(Path(work_dir))
+
+    def _open_profile_manager(self, config_path: str) -> ProfileManager:
+        """Choose this run's storage and open the ProfileManager over it.
+
+        A Supabase store is used when the database is reachable and signed in;
+        otherwise the file share, as before.
+        """
+        if _use_file_store():
+            return ProfileManager(config_path)
+        try:
+            fallback_root = resolve_file_server_path(ProfileManager._load_config(config_path))
+        except ProfileManagerError:
+            fallback_root = ""  # no share configured: the database alone can still serve this PC
+        mode, store = open_store(
+            "PackingTool-DB",
+            fallback_root=fallback_root,
+            cache_dir=Path(os.path.expanduser("~")) / ".packers_assistant" / "db_cache",
+            prompt=lambda: SignInDialog.ask(self),
+        )
+        if mode is Mode.SUPABASE:
+            return ProfileManager(config_path, store=store)
+        return ProfileManager(config_path)
 
     def _renew_lock(self, work_dir: Path) -> bool:
         """Renew the session lock. True when another PC has taken it (spec B3)."""

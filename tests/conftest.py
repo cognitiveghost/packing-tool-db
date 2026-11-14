@@ -14,8 +14,11 @@ import configparser
 import json
 import logging
 import os
+import uuid
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+# No test reaches Supabase or the keyring: the file share only, unless a test opts in.
+os.environ.setdefault("FULFILLMENT_STORE_MODE", "file")
 
 import js_coverage
 
@@ -27,6 +30,10 @@ from PySide6.QtWidgets import QApplication
 
 from packing_tool.packer_logic import PackerLogic
 from packing_tool.profile_manager import ProfileManager
+
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", "supabase: needs the local Supabase stack (SUPABASE_TEST_URL)")
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -306,3 +313,60 @@ def loaded_logic(packer_logic_factory, session_factory):
     logic = packer_logic_factory("M", work_dir)
     logic.load_packing_list_json(list_path)
     return logic
+
+
+# --- local Supabase stack (SUPABASE_TEST_URL set: CI and `supabase start`) ---
+_TABLES = [("clients", "client_id"), ("list_locks", "client_id"), ("groups", "id"), ("workers", "id"), ("stats", "id")]
+
+
+def _need(var: str) -> str:
+    val = os.environ.get(var)
+    if not val:
+        pytest.skip(f"{var} not set: no local Supabase stack")
+    return val
+
+
+@pytest.fixture(scope="session")
+def supabase_admin():
+    """Service-role client: creates users and wipes tables. Test-only; the app never has this key."""
+    from supabase import create_client
+
+    return create_client(_need("SUPABASE_TEST_URL"), _need("SUPABASE_TEST_SERVICE_KEY"))
+
+
+@pytest.fixture(scope="session")
+def supabase_user(supabase_admin):
+    """(email, password) of a throwaway signed-up user."""
+    email, password = f"t{uuid.uuid4().hex[:10]}@example.com", uuid.uuid4().hex
+    supabase_admin.auth.admin.create_user({"email": email, "password": password, "email_confirm": True})
+    return email, password
+
+
+def make_user_client(email: str, password: str):
+    from supabase import create_client
+
+    c = create_client(_need("SUPABASE_TEST_URL"), _need("SUPABASE_TEST_ANON_KEY"))
+    c.auth.sign_in_with_password({"email": email, "password": password})
+    return c
+
+
+def _wipe(admin):
+    for table, col in _TABLES:
+        admin.table(table).delete().neq(col, "" if col != "id" else 0).execute()
+    bucket = admin.storage.from_("files")
+    stack = [""]
+    while stack:
+        prefix = stack.pop()
+        for item in bucket.list(prefix, {"limit": 1000}):
+            path = f"{prefix}/{item['name']}".lstrip("/")
+            if item.get("id") is None:
+                stack.append(path)
+            else:
+                bucket.remove([path])
+
+
+@pytest.fixture
+def supabase_client(supabase_admin, supabase_user):
+    """An authenticated user client over empty tables and an empty `files` bucket."""
+    _wipe(supabase_admin)
+    return make_user_client(*supabase_user)

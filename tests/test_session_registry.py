@@ -1,14 +1,14 @@
 import json
 import os
 import threading
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from packing_tool.session_lock_manager import SessionLockManager
 from packing_tool.session_registry_manager import SessionRegistryManager
 from shared.metadata_utils import get_current_timestamp
-from shared.store import StoreError
+from shared.store import FileStore, LockInfo, StoreError
 
 
 @pytest.fixture
@@ -30,7 +30,8 @@ def _entry(profile_manager, **over):
 def _lock(work_dir, age_seconds):
     beat = (datetime.now().astimezone() - timedelta(seconds=age_seconds)).isoformat()
     (work_dir / SessionLockManager.LOCK_FILENAME).write_text(
-        json.dumps({"locked_by": "PC-1", "heartbeat": beat}), encoding="utf-8")
+        json.dumps({"locked_by": "PC-1", "user_name": "worker", "lock_time": beat, "heartbeat": beat}),
+        encoding="utf-8")
 
 
 def test_a_live_session_reads_in_progress_from_its_work_dir_lock(registry, profile_manager):
@@ -358,3 +359,56 @@ def test_a_registry_that_cannot_be_read_raises_rather_than_reading_empty(registr
         path.mkdir()
     with pytest.raises(StoreError):
         registry.read_registry("M")
+
+
+# ---------------------------------------------------------------------------
+# Derived mode (SupabaseStore): the registry is computed on read, never stored
+# ---------------------------------------------------------------------------
+
+class _DerivedStore(FileStore):
+    """A FileStore that reports derived indexes, as SupabaseStore does."""
+    derived_indexes = True
+
+
+@pytest.fixture
+def derived(profile_manager):
+    profile_manager.store = _DerivedStore(profile_manager.store.root)
+    return SessionRegistryManager(profile_manager)
+
+
+def test_derived_mode_reads_started_and_unstarted_lists_and_stores_nothing(derived, profile_manager):
+    store = profile_manager.store
+    session_dir = _session_tree(profile_manager, "2026-10-01_1", ["DHL_Orders", "L"])
+    _work_dir(session_dir, "DHL_Orders", state=STATE)
+    work_rel = "Sessions/CLIENT_M/2026-10-01_1/packing/DHL_Orders"
+
+    store.acquire_list_lock(work_rel, "PC-1", "worker")
+    entries = {e["packing_list_name"]: e["status"] for e in derived.get_all_entries("M")}
+    assert entries == {"DHL_Orders": "in_progress", "L": "not_started"}
+
+    store.release_list_lock(work_rel, "PC-1")
+    entries = {e["packing_list_name"]: e["status"] for e in derived.get_all_entries("M")}
+    assert entries == {"DHL_Orders": "paused", "L": "not_started"}
+
+    assert derived.registry_exists("M") is True
+    assert not store.exists("Sessions/CLIENT_M/registry_index.json")
+
+
+def test_derived_mode_a_failed_listing_raises_rather_than_reading_empty(derived, profile_manager, monkeypatch):
+    _session_tree(profile_manager, "2026-10-01_1", ["DHL_Orders"])
+    _fail_listing(monkeypatch, profile_manager.store, "Sessions/CLIENT_M")
+    with pytest.raises(StoreError):
+        derived.read_registry("M")
+
+
+@pytest.mark.parametrize(("age_seconds", "status"), [
+    (10, "in_progress"),
+    (SessionLockManager.STALE_TIMEOUT + 10, "stale"),
+])
+def test_a_live_entry_reads_its_heartbeat_through_lock_info(registry, profile_manager, monkeypatch,
+                                                            age_seconds, status):
+    entry, _work_dir = _entry(profile_manager)  # no lock file on disk: the Store is the only source
+    beat = datetime.now(UTC) - timedelta(seconds=age_seconds)
+    monkeypatch.setattr(profile_manager.store, "lock_info",
+                        lambda rel: LockInfo(True, "PC-1", "worker", beat))
+    assert registry._resolve_status(entry) == status
