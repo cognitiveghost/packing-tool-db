@@ -1539,7 +1539,6 @@ class MainWindow(QMainWindow):
                     except Exception as exc:
                         logger.exception("save_session_summary failed")
                         try:
-                            from shared.atomic_write import atomic_write_json
                             from shared.metadata_utils import get_current_timestamp
 
                             _minimal = {
@@ -1554,9 +1553,7 @@ class MainWindow(QMainWindow):
                                 "completed_at": get_current_timestamp(),
                                 "error": str(exc),
                             }
-                            atomic_write_json(
-                                _summary_path, _minimal, indent=2, ensure_ascii=False
-                            )
+                            _logic_ref.store.write_json(_logic_ref.summary_rel(), _minimal)
                         except Exception as minimal_exc:
                             logger.debug(
                                 f"Failed to write minimal session summary fallback: {minimal_exc}"

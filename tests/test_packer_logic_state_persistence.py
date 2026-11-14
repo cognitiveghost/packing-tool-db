@@ -150,9 +150,8 @@ def test_an_unreadable_state_file_refuses_to_open_and_is_left_alone(
 
 
 def test_a_transient_read_error_is_retried(packer_logic_factory, session_factory, monkeypatch):
-    import builtins
-
     import packing_tool.packer_logic as pl
+    from shared.store import FileStore, StoreError
 
     monkeypatch.setattr(pl, "STATE_READ_RETRY_SECONDS", 0)
     orders = [("ORDER-001", "DHL", [{"sku": "SKU-1", "quantity": 1, "product_name": "A"}])]
@@ -160,17 +159,18 @@ def test_a_transient_read_error_is_retried(packer_logic_factory, session_factory
     state_path = work_dir / "packing_state.json"
     state_path.write_text(json.dumps({"completed_orders": ["ORDER-001"]}), encoding="utf-8")
 
-    real_open, calls = builtins.open, {"n": 0}
+    real_read, calls = FileStore.read_json, {"n": 0}
 
-    def flaky_open(path, *args, **kwargs):
-        if str(path) == str(state_path):
+    def flaky_read(self, rel):
+        if rel.endswith("packing_state.json"):
             calls["n"] += 1
             if calls["n"] == 1:
-                raise OSError("The network name is no longer available")
-        return real_open(path, *args, **kwargs)
+                raise StoreError(rel) from OSError("The network name is no longer available")
+        return real_read(self, rel)
 
-    monkeypatch.setattr(builtins, "open", flaky_open)
+    monkeypatch.setattr(FileStore, "read_json", flaky_read)
     logic = packer_logic_factory("M", work_dir)
+    assert calls["n"] == 2
     assert logic.session_packing_state["completed_orders"] == ["ORDER-001"]
 
 
@@ -257,19 +257,17 @@ def test_json_cache_is_not_mutated_by_in_memory_migration(packer_logic_factory, 
 
 
 def test_a_failed_save_is_signalled_once_and_its_recovery_once(loaded_logic, monkeypatch):
-    import packing_tool.packer_logic as pl
-
     seen = []
     loaded_logic.save_failed.connect(seen.append)
-    real_write = pl.atomic_write_json
+    real_write = loaded_logic.store.write_json
 
     def failing_write(*args, **kwargs):
         raise OSError("share unavailable")
 
-    monkeypatch.setattr(pl, "atomic_write_json", failing_write)
+    monkeypatch.setattr(loaded_logic.store, "write_json", failing_write)
     loaded_logic._do_atomic_write(loaded_logic._build_state_dict())
     loaded_logic._do_atomic_write(loaded_logic._build_state_dict())
-    monkeypatch.setattr(pl, "atomic_write_json", real_write)
+    monkeypatch.setattr(loaded_logic.store, "write_json", real_write)
     loaded_logic._do_atomic_write(loaded_logic._build_state_dict())
 
     assert seen == [True, False]
