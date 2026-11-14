@@ -183,10 +183,11 @@ def test_a_failed_registry_read_does_not_wipe_it(profile_manager, monkeypatch):
         return real_read(rel)
 
     monkeypatch.setattr(store, "read_json", flaky_read)
-    assert reg.register_session_start("M", "s9", "L", None, None, "PC", 1, 1, "w", "p") is False
+    assert reg.register_session_start("M", "s9", "L", None, None, "PC", 1, 1, "w", "p")
     monkeypatch.undo()
 
-    assert len(reg.read_registry("M")["sessions"]) == 3
+    assert failed  # the read did fail once; update_json retried it
+    assert len(reg.read_registry("M")["sessions"]) == 4
 
 
 # ---------------------------------------------------------------------------

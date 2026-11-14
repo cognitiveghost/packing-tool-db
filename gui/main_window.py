@@ -59,6 +59,7 @@ from packing_tool import APP_NAME, __version__
 from packing_tool.profile_manager import (
     NetworkError,
     ProfileManager,
+    ProfileManagerError,
     resolve_file_server_path,
 )
 from packing_tool.progress_publisher import ProgressPublisher
@@ -990,9 +991,13 @@ class MainWindow(QMainWindow):
         """
         if _use_file_store():
             return ProfileManager(config_path)
+        try:
+            fallback_root = resolve_file_server_path(ProfileManager._load_config(config_path))
+        except ProfileManagerError:
+            fallback_root = ""  # no share configured: the database alone can still serve this PC
         mode, store = open_store(
             "PackingTool-DB",
-            fallback_root=resolve_file_server_path(ProfileManager._load_config(config_path)),
+            fallback_root=fallback_root,
             cache_dir=Path(os.path.expanduser("~")) / ".packers_assistant" / "db_cache",
             prompt=lambda: SignInDialog.ask(self),
         )

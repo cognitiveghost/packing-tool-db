@@ -37,8 +37,8 @@ def test_two_pcs_each_hold_a_list(pcs):
     assert b.acquire_list_lock(LIST2, "B", "bob").acquired
     assert a.lock_info(LIST1).holder_pc == "A"
     assert b.lock_info(LIST2).holder_pc == "B"
-# packing_lists/ or packing/<list> checks Storage only, so the registry scan skips it.
-# Remove the marker once exists() sees the rows under those folders.
+
+
 def test_registry_shows_both_started_lists_in_progress(pcs, tmp_path):
     a, b = pcs
     a.acquire_list_lock(LIST1, "A", "ann")

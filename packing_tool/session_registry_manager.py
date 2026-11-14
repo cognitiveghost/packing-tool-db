@@ -223,6 +223,9 @@ class SessionRegistryManager:
         In file mode this is only called once per client as a migration step
         when no registry_index.json exists. In derived mode it runs on every read.
         """
+        # ponytail: derived mode walks every session over HTTP (several requests each, plus a
+        # download of every unstarted list) on each read; replace with one Store query over
+        # packing_lists / packing_state / list_locks before the trial goes live (owner, run 123).
         registry = self._empty_registry(client_id)
         store = self.profile_manager.store
         client_rel = f"Sessions/CLIENT_{client_id}"
