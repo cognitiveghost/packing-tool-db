@@ -31,7 +31,7 @@ def _heartbeat(main_window):
 
 
 def test_a_lost_lock_stops_writing_and_tears_down_without_ending(main_window, tmp_path, monkeypatch):
-    work_dir = tmp_path / "packing" / "DHL_Orders"
+    work_dir = main_window.profile_manager.store.local_path("packing/DHL_Orders")
     work_dir.mkdir(parents=True)
     now = datetime.now().astimezone().isoformat()
     (work_dir / SessionLockManager.LOCK_FILENAME).write_text(
@@ -80,7 +80,7 @@ def test_a_lost_lock_in_packer_mode_shows_the_panel_and_waits_for_exit(
 ):
     """Frame 6j. Writing stops at once; the session is torn down when the
     packer exits, not under them."""
-    work_dir = tmp_path / "packing" / "DHL_Orders"
+    work_dir = main_window.profile_manager.store.local_path("packing/DHL_Orders")
     work_dir.mkdir(parents=True)
     now = datetime.now().astimezone().isoformat()
     (work_dir / SessionLockManager.LOCK_FILENAME).write_text(
@@ -126,7 +126,7 @@ def test_a_lock_lost_while_leaving_packer_mode_is_told_in_a_message(
     main_window, tmp_path, monkeypatch
 ):
     """The page is about to be covered, so its panel would never be read."""
-    work_dir = tmp_path / "packing" / "DHL_Orders"
+    work_dir = main_window.profile_manager.store.local_path("packing/DHL_Orders")
     work_dir.mkdir(parents=True)
     now = datetime.now().astimezone().isoformat()
     (work_dir / SessionLockManager.LOCK_FILENAME).write_text(

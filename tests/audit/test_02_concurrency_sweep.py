@@ -38,8 +38,8 @@ def _lock_owner(work_dir: Path) -> str:
 # ---------------------------------------------------------------------------
 
 
-def test_two_pcs_racing_for_a_free_list_get_one_lock(profile_manager, tmp_path):
-    work_dir = tmp_path / "L"
+def test_two_pcs_racing_for_a_free_list_get_one_lock(profile_manager):
+    work_dir = profile_manager.store.local_path("L")
     work_dir.mkdir()
     pc1, pc2 = SessionLockManager(profile_manager), SessionLockManager(profile_manager)
     pc2.hostname = "PC-2"
@@ -60,7 +60,7 @@ def test_registry_writers_do_not_drop_each_others_entries(profile_manager):
 
 
 def test_a_take_over_does_not_steal_a_lock_that_changed_meanwhile(main_window, tmp_path):
-    work_dir = tmp_path / "L"
+    work_dir = main_window.profile_manager.store.local_path("L")
     work_dir.mkdir()
     _lock(work_dir, "PC-OLD", age_seconds=600)  # stale: its PC crashed
     lock_file = work_dir / SessionLockManager.LOCK_FILENAME
@@ -219,7 +219,7 @@ def test_the_client_cannot_change_under_a_running_list(main_window_with_list, tm
 
 
 def test_the_heartbeat_runs_off_the_ui_thread_and_notices_a_takeover(main_window, tmp_path, monkeypatch, qtbot):
-    work_dir = tmp_path / "L"
+    work_dir = main_window.profile_manager.store.local_path("L")
     work_dir.mkdir()
     _lock(work_dir, "PC-2", age_seconds=0, pid=2)
     main_window.logic = Mock()
@@ -242,7 +242,7 @@ def test_the_heartbeat_runs_off_the_ui_thread_and_notices_a_takeover(main_window
 
 def test_a_release_waits_for_a_renewal_already_on_the_share(main_window, tmp_path, monkeypatch, qtbot):
     # A renewal that read the lock just before a release must not write it back afterwards.
-    work_dir = tmp_path / "L"
+    work_dir = main_window.profile_manager.store.local_path("L")
     work_dir.mkdir()
     main_window.logic = Mock()
     main_window.current_work_dir = str(work_dir)
