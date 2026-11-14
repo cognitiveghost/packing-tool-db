@@ -45,6 +45,27 @@ jobs:
           sudo apt-get update && sudo apt-get install -y libegl1 libnss3 libnspr4 libxcomposite1 libxdamage1 libxrandr2 libxkbfile1 libxtst6 libxkbcommon0 libgbm1 libasound2t64 libxcb-dri3-0
           python -m pip install --upgrade pip
           pip install -r requirements.txt -r requirements-dev.txt
+      - name: Read the synced commit
+        id: pin
+        run: |
+          sha=$(tr -d '[:space:]' < scripts/shared_synced_from.txt)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - name: Check out shopify-fulfillment-tool-db at the synced commit (source of the Supabase migrations)
+        uses: actions/checkout@v7
+        with:
+          repository: cognitiveghost/shopify-fulfillment-tool-db
+          ref: ${{ steps.pin.outputs.sha }}
+          path: fulfilment-ref
+          persist-credentials: false
+      - name: Set up Supabase CLI
+        uses: supabase/setup-cli@v1
+        with:
+          version: 3.1.0
+      - name: Start local Supabase stack
+        # Migrations come from F at the commit pinned in scripts/shared_synced_from.txt: one source.
+        run: |
+          supabase start --workdir fulfilment-ref
+          supabase status --workdir fulfilment-ref -o env | sed -e 's/^API_URL=/SUPABASE_TEST_URL=/' -e 's/^ANON_KEY=/SUPABASE_TEST_ANON_KEY=/' -e 's/^SERVICE_ROLE_KEY=/SUPABASE_TEST_SERVICE_KEY=/' | tr -d '"' | grep '^SUPABASE_TEST_' >> "$GITHUB_ENV"
       - name: Lint (ruff)
         # shared/ is a synced copy of shopify-fulfillment-tool's; it is linted there.
         run: ruff check . --exclude shared
@@ -74,10 +95,10 @@ jobs:
             exit 1
           fi
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
-      - name: Check out shopify-fulfillment-tool at that commit (canonical shared/ source)
+      - name: Check out shopify-fulfillment-tool-db at that commit (canonical shared/ source)
         uses: actions/checkout@v7
         with:
-          repository: cognitiveghost/shopify-fulfillment-tool
+          repository: cognitiveghost/shopify-fulfillment-tool-db
           ref: ${{ steps.pin.outputs.sha }}
           path: fulfilment-ref
           persist-credentials: false
