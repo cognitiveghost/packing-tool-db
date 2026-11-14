@@ -16,3 +16,8 @@ ignore = [
 # QModelIndex() is an immutable value type (Qt's standard "no parent" sentinel),
 # so using it as a default argument is safe despite the general mutable-default footgun.
 extend-immutable-calls = ["PySide6.QtCore.QModelIndex"]
+
+[lint.isort]
+# shared/ is mirrored from the sibling repo, where a local supabase/ directory makes
+# ruff sort `supabase` as first-party. Match it so the mirror stays lint-clean.
+known-first-party = ["supabase"]
