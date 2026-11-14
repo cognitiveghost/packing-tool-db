@@ -3,6 +3,7 @@
 Flags lines in packing_tool/, gui/ and shared/ that build or open a path from a server-root name,
 and any atomic_write_json( / replace_with_retry( / locked_file( call outside the store seam.
 Files that legitimately do this are listed in tests/store_guard_allow.txt (matched by file path).
+A single line that legitimately does it carries a `# store-guard: allow <reason>` comment.
 """
 import re
 from pathlib import Path
@@ -19,6 +20,7 @@ PATH_USE = re.compile(
     rf"|(?:\s/\s|os\.path\.join|\bopen\(|\bPath\().*\b{NAMES}\b"
 )
 PRIMITIVE = re.compile(r"\b(?:atomic_write_json|replace_with_retry|locked_file)\(")
+LINE_ALLOW = "# store-guard: allow"
 
 
 def _allowed() -> set[str]:
@@ -38,6 +40,8 @@ def _hits() -> list[str]:
             if rel in EXEMPT or re.fullmatch(r"shared/store[^/]*\.py", rel):
                 continue
             for n, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
+                if LINE_ALLOW in line:
+                    continue
                 code = line.split("#", 1)[0]
                 if code.lstrip().startswith(('"', "'")) or not code.strip():
                     continue

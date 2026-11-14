@@ -36,7 +36,7 @@ from packing_tool.session_lock_manager import SessionLockManager
 from shared.atomic_write import atomic_write_json
 from shared.file_lock import FileLockError, locked_file
 from shared.metadata_utils import get_current_timestamp, parse_timestamp
-from shared.store import StoreError, StoreNotFound
+from shared.store import Store, StoreError, StoreNotFound
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +51,11 @@ ABANDONED_SECONDS = 86400  # 24 hours
 # A read inside a locked update is retried before it gives up (AUDIT-02-5)
 REGISTRY_READ_ATTEMPTS = 3
 REGISTRY_READ_RETRY_SECONDS = 0.2
+
+
+def _rel(store: Store, path) -> str:
+    """Store path (POSIX, relative to the server root) of a path inside the store."""
+    return Path(path).relative_to(store.local_path("")).as_posix()
 
 
 class SessionRegistryManager:
@@ -107,7 +112,7 @@ class SessionRegistryManager:
         """
         path = self._get_registry_path(client_id)
         path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path.with_name(path.name + ".lock"), "a+") as handle, locked_file(handle):
+        with open(path.with_name(path.name + ".lock"), "a+") as handle, locked_file(handle):  # store-guard: allow registry_index.json
             yield
 
     # ------------------------------------------------------------------ #
@@ -177,7 +182,7 @@ class SessionRegistryManager:
         registry["last_updated"] = get_current_timestamp()
 
         try:
-            atomic_write_json(path, registry, indent=2, ensure_ascii=False)
+            atomic_write_json(path, registry, indent=2, ensure_ascii=False)  # store-guard: allow registry_index.json
             return True
         except Exception:
             logger.exception(
@@ -229,27 +234,26 @@ class SessionRegistryManager:
         all updates go through the targeted mutation methods.
         """
         registry = self._empty_registry(client_id)
-        client_dir = self.profile_manager.store.local_path(f"Sessions/CLIENT_{client_id}")
+        store = self.profile_manager.store
+        client_rel = f"Sessions/CLIENT_{client_id}"
 
-        if not client_dir.exists():
-            logger.warning(f"Client directory not found: {client_dir}")
+        if not store.exists(client_rel):
+            logger.warning(f"Client directory not found: {store.local_path(client_rel)}")
             return registry
 
         session_count = 0
         try:
-            for entry in os.scandir(client_dir):
-                if not entry.is_dir():
-                    continue
-                if entry.name.startswith(".") or entry.name == self.REGISTRY_FILENAME:
+            for name in store.list_dir(client_rel):  # names only: a plain file has no packing_lists/ and is skipped
+                if name.startswith(".") or name == self.REGISTRY_FILENAME:
                     continue
 
-                session_id = entry.name
-                session_dir = Path(entry.path)
                 session_count += 1
-                self._scan_session_dir(registry, client_id, session_id, session_dir)
+                self._scan_session_dir(
+                    registry, client_id, name, store.local_path(f"{client_rel}/{name}")
+                )
 
         except Exception:
-            logger.exception(f"Error scanning {client_dir}")
+            logger.exception(f"Error scanning {store.local_path(client_rel)}")
 
         logger.info(
             f"Registry scan for client {client_id} complete: "
@@ -274,17 +278,20 @@ class SessionRegistryManager:
         - Legacy Excel workflow:    session_dir/barcodes/ work dir
         """
         # --- Shopify: discover packing lists and their work dirs ---
+        store = self.profile_manager.store
+        session_rel = _rel(store, session_dir)
+        packing_lists_rel = f"{session_rel}/packing_lists"
         packing_lists_dir = session_dir / "packing_lists"
         packing_dir_root = session_dir / "packing"
 
-        if packing_lists_dir.exists():
-            for pl_entry in os.scandir(packing_lists_dir):
-                if not pl_entry.name.endswith(".json"):
+        if store.exists(packing_lists_rel):
+            for name in store.list_dir(packing_lists_rel):
+                if not name.endswith(".json"):
                     continue
-                pl_name = Path(pl_entry.name).stem
+                pl_name = Path(name).stem
                 work_dir = packing_dir_root / pl_name
 
-                if work_dir.exists():
+                if store.exists(f"{session_rel}/packing/{pl_name}"):
                     # Session was started for this list
                     self._register_from_work_dir(
                         registry, session_id, pl_name, work_dir, session_dir
@@ -292,23 +299,23 @@ class SessionRegistryManager:
                 else:
                     # Packing list uploaded but never started → available
                     self._register_available_from_file(
-                        registry, session_id, pl_name, Path(pl_entry.path), session_dir
+                        registry, session_id, pl_name, packing_lists_dir / name, session_dir
                     )
 
         # --- Legacy Excel: session_dir/barcodes/ ---
         barcodes_dir = session_dir / "barcodes"
-        if barcodes_dir.exists() and not packing_lists_dir.exists():
-            state_file = barcodes_dir / "packing_state.json"
-            if state_file.exists():
+        barcodes_rel = f"{session_rel}/barcodes"
+        if store.exists(barcodes_rel) and not store.exists(packing_lists_rel):
+            state_rel = f"{barcodes_rel}/packing_state.json"
+            if store.exists(state_rel):
                 try:
-                    with open(state_file, "r", encoding="utf-8") as f:
-                        state = json.load(f)
+                    state = store.read_json(state_rel)
                     pl_name = state.get("packing_list_name", "unknown")
                     self._register_from_work_dir(
                         registry, session_id, pl_name, barcodes_dir, session_dir
                     )
                 except Exception as e:
-                    logger.debug(f"Could not read legacy barcodes state {state_file}: {e}")
+                    logger.debug(f"Could not read legacy barcodes state {state_rel}: {e}")
 
     def _register_from_work_dir(
         self,
@@ -320,29 +327,29 @@ class SessionRegistryManager:
     ):
         """Parse a started-session work directory and add an entry to registry."""
         key = self._session_key(session_id, packing_list_name)
+        store = self.profile_manager.store
+        work_rel = _rel(store, work_dir)
 
         # Prefer summary (completed) over state file (in-progress / paused)
-        summary_file = work_dir / "session_summary.json"
-        state_file = work_dir / "packing_state.json"
+        summary_rel = f"{work_rel}/session_summary.json"
+        state_rel = f"{work_rel}/packing_state.json"
         # MainWindow locks the work folder (packing/<list>/), not the session folder.
-        lock_file = work_dir / SessionLockManager.LOCK_FILENAME
-        info_file = session_dir / "session_info.json"
+        lock_rel = f"{work_rel}/{SessionLockManager.LOCK_FILENAME}"
+        info_rel = f"{_rel(store, session_dir)}/session_info.json"
         pc_name = os.environ.get("COMPUTERNAME", "Unknown")
 
         # Read session_info for basic metadata
         session_info = {}
-        if info_file.exists():
+        if store.exists(info_rel):
             try:
-                with open(info_file, "r", encoding="utf-8") as f:
-                    session_info = json.load(f)
+                session_info = store.read_json(info_rel)
                 pc_name = session_info.get("pc_name", pc_name)
             except Exception as info_exc:
-                logger.debug(f"Could not read pc_name from {info_file}: {info_exc}")
+                logger.debug(f"Could not read pc_name from {info_rel}: {info_exc}")
 
-        if summary_file.exists():
+        if store.exists(summary_rel):
             try:
-                with open(summary_file, "r", encoding="utf-8") as f:
-                    summary = json.load(f)
+                summary = store.read_json(summary_rel)
                 total_orders = summary.get("total_orders", 0)
                 completed_orders = summary.get("completed_orders", 0)
                 all_done = total_orders > 0 and completed_orders == total_orders
@@ -367,17 +374,16 @@ class SessionRegistryManager:
                 }
                 return
             except Exception as e:
-                logger.debug(f"Could not read summary {summary_file}: {e}")
+                logger.debug(f"Could not read summary {summary_rel}: {e}")
 
-        if state_file.exists():
+        if store.exists(state_rel):
             try:
-                with open(state_file, "r", encoding="utf-8") as f:
-                    state = json.load(f)
+                state = store.read_json(state_rel)
                 progress = state.get("progress", {})
 
-                if lock_file.exists():
+                if store.exists(lock_rel):
                     status = "in_progress"
-                elif info_file.exists():
+                elif store.exists(info_rel):
                     status = "paused"
                 else:
                     status = "incomplete"
@@ -402,7 +408,7 @@ class SessionRegistryManager:
                     "metrics": None,
                 }
             except Exception as e:
-                logger.debug(f"Could not read state {state_file}: {e}")
+                logger.debug(f"Could not read state {state_rel}: {e}")
 
     def _register_available_from_file(
         self,
@@ -414,10 +420,11 @@ class SessionRegistryManager:
     ):
         """Parse an unstarted packing list JSON and add it to available_lists, with its mtime."""
         key = self._session_key(session_id, packing_list_name)
+        store = self.profile_manager.store
         try:
+            # Raw stat, not a read: the float mtime is the change key refresh_available_lists compares.
             mtime = pl_file.stat().st_mtime  # before the read: a rewrite mid-read is re-read next time
-            with open(pl_file, "r", encoding="utf-8") as f:
-                pl_data = json.load(f)
+            pl_data = store.read_json(_rel(store, pl_file))
             # Courier may be under different keys depending on Shopify tool version
             courier = (
                 pl_data.get("courier")
@@ -704,25 +711,22 @@ class SessionRegistryManager:
             # The Shopify path locks the work directory; Excel entries have no work_dir.
             lock_dir = entry.get("work_dir") or entry.get("session_path", "")
             if lock_dir:
-                lock_file = Path(lock_dir) / SessionLockManager.LOCK_FILENAME
-                if lock_file.exists():
-                    heartbeat_age = self._get_lock_heartbeat_age(lock_file)
-                    if heartbeat_age is not None:
-                        return "in_progress" if heartbeat_age < STALE_HEARTBEAT_SECONDS else "stale"
-                # Lock file missing but registry says in_progress → treat as paused
+                heartbeat_age = self._get_lock_heartbeat_age(lock_dir)
+                if heartbeat_age is not None:
+                    return "in_progress" if heartbeat_age < STALE_HEARTBEAT_SECONDS else "stale"
+                # Lock file missing or unreadable, but registry says in_progress → treat as paused
                 return "paused"
 
         return stored or "incomplete"
 
-    @staticmethod
-    def _get_lock_heartbeat_age(lock_file: Path) -> float | None:
+    def _get_lock_heartbeat_age(self, lock_dir: str) -> float | None:
         """
-        Read .session.lock and return seconds since last heartbeat.
-        Returns None if the file cannot be read or parsed.
+        Read the work folder's .session.lock and return seconds since last heartbeat.
+        Returns None if the file cannot be read or parsed (a missing lock included).
         """
         try:
-            with open(lock_file, "r", encoding="utf-8") as f:
-                lock_data = json.load(f)
+            store = self.profile_manager.store
+            lock_data = store.read_json(f"{_rel(store, lock_dir)}/{SessionLockManager.LOCK_FILENAME}")
             heartbeat_str = lock_data.get("heartbeat") or lock_data.get("lock_time")
             if not heartbeat_str:
                 return None
@@ -752,45 +756,43 @@ class SessionRegistryManager:
         """
         registry = self.read_registry(client_id)  # snapshot, only to decide what to re-read
         found = self._empty_registry(client_id)  # what the scan turns up; merged under the lock
-        client_dir = self.profile_manager.store.local_path(f"Sessions/CLIENT_{client_id}")
-        if not client_dir.exists():
+        store = self.profile_manager.store
+        client_rel = f"Sessions/CLIENT_{client_id}"
+        if not store.exists(client_rel):
             return 0
 
         available = registry["available_lists"]
         seen: set[str] = set()  # available keys whose JSON is still on disk
         scanned_sessions: set[str] = set()  # session dirs whose packing_lists/ was listed
         try:
-            for s_entry in os.scandir(client_dir):
-                if not s_entry.is_dir():
+            for session_id in store.list_dir(client_rel):
+                session_rel = f"{client_rel}/{session_id}"
+                pl_rel = f"{session_rel}/packing_lists"
+                if not store.exists(pl_rel):  # absent, not empty: an empty folder still counts as listed
                     continue
-                session_id = s_entry.name
-                pl_dir = Path(s_entry.path) / "packing_lists"
-                packing_root = Path(s_entry.path) / "packing"
-                if not pl_dir.exists():
-                    continue
+                session_dir = store.local_path(session_rel)
+                pl_dir = store.local_path(pl_rel)
 
-                for pl_entry in os.scandir(pl_dir):
-                    if not pl_entry.name.endswith(".json"):
+                for name in store.list_dir(pl_rel):
+                    if not name.endswith(".json"):
                         continue
-                    pl_name = Path(pl_entry.name).stem
+                    pl_name = Path(name).stem
                     key = self._session_key(session_id, pl_name)
                     if key in registry["sessions"]:
                         continue
                     seen.add(key)
 
-                    work_dir = packing_root / pl_name
-                    if work_dir.exists():
+                    work_dir = session_dir / "packing" / pl_name
+                    pl_file = pl_dir / name
+                    if store.exists(f"{session_rel}/packing/{pl_name}"):
                         # Session was started; do a full register
                         self._register_from_work_dir(
-                            found, session_id, pl_name, work_dir, Path(s_entry.path)
+                            found, session_id, pl_name, work_dir, session_dir
                         )
-                    elif key not in available or available[key].get("mtime") != pl_entry.stat().st_mtime:
+                    # Raw stat, not a read: the float mtime is the change key stored in the registry.
+                    elif key not in available or available[key].get("mtime") != pl_file.stat().st_mtime:
                         self._register_available_from_file(
-                            found,
-                            session_id,
-                            pl_name,
-                            Path(pl_entry.path),
-                            Path(s_entry.path),
+                            found, session_id, pl_name, pl_file, session_dir
                         )
                 scanned_sessions.add(session_id)
 
