@@ -1,5 +1,5 @@
 """Local dev runner: launches Packer's Assistant against the shared dev-server
-used by shopify-fulfillment-tool (sibling repo), instead of the production
+used by shopify-fulfillment-tool-db (sibling fork), instead of the production
 network share in config.ini.
 """
 import os
@@ -8,13 +8,13 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).parent
-DEV_SERVER = ROOT.parent / "shopify-fulfillment-tool" / "dev-server"
+DEV_SERVER = ROOT.parent / "shopify-fulfillment-tool-db" / "dev-server"
 CONFIG_DEV = ROOT / "config.dev.ini"
 
 if not DEV_SERVER.is_dir():
     sys.exit(
         f"Dev server not found at {DEV_SERVER}\n"
-        "Run shopify-fulfillment-tool's run_dev.py first to create it."
+        "Run shopify-fulfillment-tool-db's run_dev.py first to create it."
     )
 
 CONFIG_DEV.write_text(f"""[Network]
