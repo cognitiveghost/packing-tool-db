@@ -10,6 +10,7 @@ import json
 import os
 import shutil
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -25,6 +26,26 @@ from shared.store import (
 )
 
 OUTBOX = "outbox.jsonl"
+LIST_META = "list.json"  # the bound list: what a restart needs to reopen it with no database
+SNAPSHOT = "snapshot"  # copies of the documents the bound list reads, served when unreachable
+
+
+def _read_meta(buffer_dir: Path) -> dict | None:
+    try:
+        return json.loads((Path(buffer_dir) / LIST_META).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except ValueError:
+        return None  # unreadable: the outbox still names its list (spec §8.3)
+
+
+def _write_meta(buffer_dir: Path, meta: dict) -> None:
+    tmp = Path(buffer_dir) / (LIST_META + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(meta, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, Path(buffer_dir) / LIST_META)
 
 
 @dataclass
@@ -60,36 +81,93 @@ def _drop_torn_tail(path: Path) -> None:
 
 
 class BufferedStore(Store):
-    def __init__(self, inner: Store, buffer_dir: Path, *, list_dir: str, pc: str):
+    def __init__(
+        self, inner: Store, buffer_dir: Path, *, pc: str, on_change: Callable[[bool], None] | None = None
+    ):
         self.inner = inner
         self.buffer_dir = Path(buffer_dir)
-        self.list_rel = list_dir  # not self.list_dir: that is the Store method below
         self.pc = pc
         self.derived_indexes = inner.derived_indexes
+        self._on_change = on_change
         self._state = FileStore(self.buffer_dir / "state")
+        self._snapshot = FileStore(self.buffer_dir / SNAPSHOT)
         # The heartbeat thread flushes while the UI thread writes: an op appended mid-flush
         # must never be cleared unpushed.
         self._mutex = threading.RLock()
-        parts = list_dir.split("/")
-        self._allowed_exact = {STATS_REL, "/".join(parts[:3] + [SESSION_INFO])}
         self.buffer_dir.mkdir(parents=True, exist_ok=True)
         _drop_torn_tail(self.buffer_dir / OUTBOX)
         ops = self._ops()
-        if ops and ops[0]["list_dir"] != list_dir:
-            # One outbox holds one list: its ops are checked against that list's lock only.
-            raise StoreError(f"offline progress for {ops[0]['list_dir']} is not synced yet")
         # The outbox is the truth; state/ is its read cache. Rebuild it, so a kill between
         # the two writes, or a half-done clear, never serves a value the outbox lacks.
         shutil.rmtree(self.buffer_dir / "state", ignore_errors=True)
         for op in ops:
             if op["op"] != "write_bytes":
                 self._state.write_json(op["rel"], op["data"])
-        self.online = not ops  # a leftover outbox means we have not flushed yet
+        self._online = not ops  # a leftover outbox means we have not flushed yet
+        self._bind(_read_meta(self.buffer_dir))
+
+    @property
+    def online(self) -> bool:
+        return self._online
+
+    @online.setter
+    def online(self, value: bool) -> None:
+        value = bool(value)
+        if value != self._online:
+            self._online = value
+            if self._on_change:
+                self._on_change(value)
+
+    def _bind(self, meta: dict | None) -> None:
+        self._meta = meta
+        self._list_dir = meta["list_dir"] if meta else None
 
     @staticmethod
     def pending(buffer_dir: Path) -> str | None:
         ops = _read_outbox(buffer_dir)
         return ops[0]["list_dir"] if ops else None
+
+    @staticmethod
+    def pending_meta(buffer_dir: Path) -> dict | None:
+        return _read_meta(buffer_dir) if _read_outbox(buffer_dir) else None
+
+    def bound_list(self) -> dict | None:
+        return dict(self._meta) if self._meta else None
+
+    def begin_list(self, list_dir: str, meta: dict, snapshot_rels: list[str]) -> None:
+        """Bind the run to the open list, keeping what a restart offline reads of it."""
+        with self._mutex:
+            ops = self._ops()
+            if ops and ops[0]["list_dir"] != list_dir:
+                # One outbox holds one list: its ops are checked against that list's lock only.
+                raise StoreError(f"offline progress for {ops[0]['list_dir']} is not synced yet")
+            # Read everything before writing anything: a failed read leaves the old snapshot intact.
+            docs = {}
+            for rel in snapshot_rels:
+                try:
+                    docs[rel] = self.inner.read_json(rel)
+                except StoreNotFound:
+                    continue
+            for rel, data in docs.items():
+                self._snapshot.write_json(rel, data)
+            entry = {**meta, "list_dir": list_dir}
+            _write_meta(self.buffer_dir, entry)
+            self._bind(entry)
+
+    def end_list(self) -> None:
+        """Unbind once the outbox is empty. Pending ops keep the list bound: they still need it."""
+        with self._mutex:
+            if self._ops():
+                return
+            (self.buffer_dir / LIST_META).unlink(missing_ok=True)
+            shutil.rmtree(self.buffer_dir / SNAPSHOT, ignore_errors=True)
+            self._bind(None)
+
+    def attach(self, inner: Store) -> None:
+        """Swap in the real backend once it is connected (UnreachableStore before that)."""
+        with self._mutex:
+            self.inner = inner
+            self.derived_indexes = inner.derived_indexes
 
     # --- outbox -----------------------------------------------------------
     def _ops(self) -> list[dict]:
@@ -107,12 +185,16 @@ class BufferedStore(Store):
                 raise
 
     def _check_allowed(self, rel: str) -> None:
-        if rel not in self._allowed_exact and not rel.startswith(self.list_rel + "/"):
+        lst = self._list_dir
+        if lst is None:
+            raise StoreUnreachable("offline")
+        session_info = "/".join(lst.split("/")[:3] + [SESSION_INFO])
+        if rel not in (STATS_REL, session_info) and not rel.startswith(lst + "/"):
             raise StoreUnreachable("offline")
 
     def _buffer(self, op: str, rel: str, data=None, blob: bytes | None = None) -> None:
         self._check_allowed(rel)
-        entry = {"op": op, "rel": rel, "list_dir": self.list_rel}
+        entry = {"op": op, "rel": rel, "list_dir": self._list_dir}
         with self._mutex:
             if blob is not None:
                 self._state.write_bytes(rel, blob)  # the blob exists before an op names it
@@ -135,28 +217,30 @@ class BufferedStore(Store):
     def _buffered(self, rel) -> bool:
         return not self.online and self._state.exists(rel)
 
+    def _inner_or_snapshot(self, rel, read, fallback):
+        """Inner first. Unreachable: go offline, and serve the snapshot copy of rel when there is one."""
+        try:
+            return read()
+        except StoreError as e:
+            self._lost(e)
+            if isinstance(e, StoreUnreachable) and self._snapshot.exists(rel):
+                return fallback()
+            raise
+
     def read_json(self, rel):
         if self._buffered(rel):
             return self._state.read_json(rel)
-        try:
-            return self.inner.read_json(rel)
-        except StoreError as e:
-            self._lost(e)
-            raise
+        return self._inner_or_snapshot(rel, lambda: self.inner.read_json(rel), lambda: self._snapshot.read_json(rel))
 
     def read_bytes(self, rel):
         if self._buffered(rel):
             return self._state.read_bytes(rel)
-        try:
-            return self.inner.read_bytes(rel)
-        except StoreError as e:
-            self._lost(e)
-            raise
+        return self._inner_or_snapshot(rel, lambda: self.inner.read_bytes(rel), lambda: self._snapshot.read_bytes(rel))
 
     def exists(self, rel):
         if self._buffered(rel):
             return True
-        return self._inner(self.inner.exists, rel)
+        return self._inner_or_snapshot(rel, lambda: self.inner.exists(rel), lambda: True)
 
     # --- writes: inner when online and nothing queued, else the outbox -----------
     # Under the mutex, so a write never lands directly on inner while older ops still wait.
@@ -262,13 +346,14 @@ class BufferedStore(Store):
             if not ops:
                 self.online = True
                 return FlushResult(0)
+            list_dir = ops[0]["list_dir"]  # one outbox holds one list
             try:
-                ours = self.inner.heartbeat_list_lock(self.list_rel, self.pc)
+                ours = self.inner.heartbeat_list_lock(list_dir, self.pc)
             except StoreError:
                 self.online = False
                 return FlushResult(0)
             if not ours:
-                return self._write_conflict(ops)
+                return self._write_conflict(ops, list_dir)
             pushed = 0
             for op in ops:
                 try:
@@ -293,7 +378,7 @@ class BufferedStore(Store):
             os.fsync(f.fileno())
         os.replace(tmp, self.buffer_dir / OUTBOX)
 
-    def _write_conflict(self, ops: list[dict]) -> FlushResult:
+    def _write_conflict(self, ops: list[dict], list_dir: str) -> FlushResult:
         """Another PC took the list: park everything we buffered beside its state, overwrite nothing."""
         state: dict = {}
         blobs: dict = {}
@@ -303,7 +388,7 @@ class BufferedStore(Store):
             else:
                 state[op["rel"]] = op["data"]
         stamp = datetime.now().strftime("%Y%m%d%H%M%S")
-        rel = f"{self.list_rel}/packing_state_conflict_{self.pc}_{stamp}.json"
+        rel = f"{list_dir}/packing_state_conflict_{self.pc}_{stamp}.json"
         try:
             self.inner.write_json(rel, {"pc": self.pc, "state": state, "blobs_b64": blobs})
         except StoreError:
@@ -312,3 +397,24 @@ class BufferedStore(Store):
         self._clear()
         self.online = True
         return FlushResult(0, rel)
+
+
+_STORE_METHODS = [n for n, v in vars(Store).items() if callable(v) and not n.startswith("_")]
+
+
+def _unreachable(name: str):
+    def refuse(self, *args, **kwargs):
+        raise StoreUnreachable("database not connected")
+
+    refuse.__name__ = name
+    return refuse
+
+
+class UnreachableStore(Store):
+    """The Store before a database sign-in: every call is a network failure, so writes queue."""
+
+    derived_indexes = True
+
+
+for _name in _STORE_METHODS:
+    setattr(UnreachableStore, _name, _unreachable(_name))

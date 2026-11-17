@@ -1068,7 +1068,7 @@ class MainWindow(QMainWindow):
                     return True
                 if not isinstance(store, SupabaseStore):
                     return False
-                store = BufferedStore(store, buffer_dir, list_dir=pending, pc=pc)
+                store = BufferedStore(store, buffer_dir, pc=pc)
             res = store.flush()
             if res.conflict_rel:
                 self._on_offline_conflict(res.conflict_rel)
@@ -1093,9 +1093,9 @@ class MainWindow(QMainWindow):
         if not isinstance(pm.store, SupabaseStore):
             return
         list_dir = Path(work_dir).relative_to(pm.store.local_path("")).as_posix()
-        pm.store = BufferedStore(
-            pm.store, _offline_buffer_dir(), list_dir=list_dir, pc=self.lock_manager.hostname
-        )
+        wrapped = BufferedStore(pm.store, _offline_buffer_dir(), pc=self.lock_manager.hostname)
+        wrapped.begin_list(list_dir, {}, [])  # P6 binds the run's list with its snapshot
+        pm.store = wrapped
 
     def _unwrap_store(self):
         pm = self.profile_manager

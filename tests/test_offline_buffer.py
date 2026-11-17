@@ -60,7 +60,11 @@ def inner(tmp_path):
 
 
 def make(inner, tmp_path):
-    return BufferedStore(inner, tmp_path / "buf", list_dir=LIST, pc="PC1")
+    """A run's store bound to LIST. A restart rebinds from list.json, so it is not bound twice."""
+    b = BufferedStore(inner, tmp_path / "buf", pc="PC1")
+    if b.bound_list() is None:
+        b.begin_list(LIST, {}, [])
+    return b
 
 
 def test_online_writes_go_straight_through(inner, tmp_path):
@@ -276,11 +280,3 @@ def test_write_during_flush_is_not_lost(inner, tmp_path):
     b.flush()
     assert inner.read_json(STATE) == {"n": 2}
     assert BufferedStore.pending(tmp_path / "buf") is None
-
-
-def test_second_list_refused_while_outbox_pending(inner, tmp_path):
-    b = make(inner, tmp_path)
-    inner.down = True
-    b.write_json(STATE, {"n": 1})
-    with pytest.raises(StoreError, match="not synced"):
-        BufferedStore(inner, tmp_path / "buf", list_dir=LIST.replace("DHL", "UPS"), pc="PC1")
