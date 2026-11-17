@@ -339,9 +339,10 @@ class SessionRegistryManager:
         """Fill registry from the Store's packing_overview (derived mode). A StoreError propagates."""
         store = self.profile_manager.store
         default_pc = os.environ.get("COMPUTERNAME", "Unknown")
+        root = store.local_path("")  # joined, not local_path(rel): a dot in a list name would route it as a blob
         for row in store.packing_overview(client_id):
             session, list_name = row["session_name"], row["list_name"]
-            session_dir = store.local_path(f"Sessions/CLIENT_{client_id}/{session}")
+            session_dir = root / "Sessions" / f"CLIENT_{client_id}" / session
             info = row["session_info"]
             pc_name = default_pc if info is None or info.get("pc_name") is None else info["pc_name"]
             key = self._session_key(session, list_name)
@@ -349,7 +350,7 @@ class SessionRegistryManager:
                 entry = _started_entry(
                     session, list_name, summary=row["summary"], state=row["state"],
                     locked=row["lock"] is not None, has_info=info is not None, info_pc=pc_name,
-                    work_dir=store.local_path(row["work_rel"]), session_dir=session_dir,
+                    work_dir=root / row["work_rel"], session_dir=session_dir,
                 )
                 if entry is not None:
                     registry["sessions"][key] = entry
