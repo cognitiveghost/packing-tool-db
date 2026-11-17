@@ -248,6 +248,9 @@ class BufferedStore(Store):
     def query_sessions(self, client_id):
         return self._inner(self.inner.query_sessions, client_id)
 
+    def packing_overview(self, client_id):
+        return self._inner(self.inner.packing_overview, client_id)
+
     # --- flush ---------------------------------------------------------------
     def _clear(self) -> None:
         (self.buffer_dir / OUTBOX).unlink(missing_ok=True)
