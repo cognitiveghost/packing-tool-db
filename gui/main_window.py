@@ -84,7 +84,7 @@ from shared.server_connection import (
 )
 from shared.session_id import derive_session_id
 from shared.stats_manager import StatsManager
-from shared.store import StoreError
+from shared.store import SESSION_INFO, StoreError
 from shared.store_mode import Mode, open_store
 from shared.theme import (
     theme_notifier,
@@ -160,6 +160,11 @@ def _under_pytest() -> bool:
 def _offline_buffer_dir() -> Path:
     base = QStandardPaths.writableLocation(QStandardPaths.AppLocalDataLocation)
     return Path(base) / "PackingTool-DB" / "buffer"
+
+
+def _store_rel(store, path) -> str:
+    """The store path (POSIX, from the server root) of a path inside the store's local tree."""
+    return Path(path).relative_to(store.local_path("")).as_posix()
 
 
 def _use_file_store() -> bool:
@@ -1093,13 +1098,29 @@ class MainWindow(QMainWindow):
         """This run's store in database mode; None in file mode."""
         return self._run_store
 
-    def _wrap_store_for_list(self, work_dir: Path):
-        """Packing a list on the database: its writes buffer while the network is down."""
+    def _bind_list(self, client_id, session_path, work_dir, packing_list_path, packing_list_name):
+        """Bind this run's store to the list being opened: a restart offline reopens it from these."""
         store = self.buffered_store
         if store is None:
             return
-        list_dir = Path(work_dir).relative_to(store.local_path("")).as_posix()
-        store.begin_list(list_dir, {}, [])  # the real meta and snapshot come next
+        session_rel = _store_rel(store, session_path)
+        work_dir_rel = _store_rel(store, work_dir)
+        meta = {
+            "client_id": client_id,
+            "session_name": session_path.name,
+            "list_name": packing_list_name,
+            "work_dir_rel": work_dir_rel,
+            "worker_id": self.current_worker_id,
+            "worker_name": self.current_worker_name,
+            "pc": self.lock_manager.hostname,
+            "user": self.lock_manager.username,
+        }
+        snapshot = [
+            _store_rel(store, packing_list_path),
+            f"Clients/CLIENT_{client_id}/packer_config.json",
+            f"{session_rel}/{SESSION_INFO}",
+        ]
+        store.begin_list(work_dir_rel, meta, snapshot)
 
     def _renew_lock(self, work_dir: Path) -> bool:
         """Renew the session lock. True when another PC has taken it (spec B3)."""
@@ -1373,8 +1394,9 @@ class MainWindow(QMainWindow):
             # The lock is taken on this thread: let the page hear about step 1.
             QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
 
-            # 1. Validate packing list file exists
-            if not packing_list_path.exists():
+            # 1. Validate packing list file exists (through the store: on Supabase it is not a local file)
+            store = self.profile_manager.store
+            if not store.exists(_store_rel(store, packing_list_path)):
                 raise FileNotFoundError(f"Packing list not found: {packing_list_path}")
 
             # 2. Store session state
@@ -1390,7 +1412,7 @@ class MainWindow(QMainWindow):
                 raise RuntimeError(error_msg)
 
             logger.info(f"Lock acquired on {work_dir}")
-            self._wrap_store_for_list(work_dir)
+            self._bind_list(client_id, session_path, work_dir, packing_list_path, packing_list_name)
 
             # 4. Start heartbeat timer
             self._start_heartbeat_timer()
@@ -1842,6 +1864,8 @@ class MainWindow(QMainWindow):
         if self.logic:
             self.logic.end_session_cleanup()
             self.logic = None
+        if self.buffered_store is not None:
+            self.buffered_store.end_list()  # unbinds unless progress is still waiting to sync
 
         # Clear Shopify session variables
         if hasattr(self, "current_work_dir"):

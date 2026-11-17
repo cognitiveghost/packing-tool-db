@@ -1470,28 +1470,25 @@ class PackerLogic(QObject):
         """
         logger.info(f"Loading packing list from: {packing_list_path}")
 
-        # Validate file exists
+        # Read through the store: on Supabase the list is not a local file, and while the database
+        # is unreachable the run's snapshot serves it.
         packing_list_path = Path(packing_list_path)
-        if not packing_list_path.exists():
-            error_msg = f"Packing list file not found: {packing_list_path}"
-            logger.error(error_msg)
-            raise ValueError(error_msg)
 
         # Extract list name from filename (without .json extension)
         list_name = packing_list_path.stem
 
         # Load JSON data
+        rel = packing_list_path.relative_to(self.store.local_path("")).as_posix()
         try:
-            with open(packing_list_path, 'r', encoding='utf-8') as f:
-                packing_data = json.load(f)
+            packing_data = self.store.read_json(rel)
 
             logger.debug(f"Loaded packing list: {packing_data.get('list_name', list_name)}")
 
-        except json.JSONDecodeError as e:
-            error_msg = f"Invalid JSON in packing list file: {e}"
-            logger.exception(error_msg)
+        except StoreNotFound:
+            error_msg = f"Packing list file not found: {packing_list_path}"
+            logger.error(error_msg)
             raise ValueError(error_msg)
-        except Exception as e:
+        except StoreError as e:  # unreadable or invalid JSON, or the store unreachable
             error_msg = f"Error reading packing list file: {e}"
             logger.exception(error_msg)
             raise ValueError(error_msg)
