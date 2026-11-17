@@ -10,7 +10,7 @@ import logging
 from pathlib import Path
 
 from shared.metadata_utils import get_current_timestamp
-from shared.store import Store, StoreNotFound
+from shared.store import Delta, Store, StoreNotFound, delta
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +21,28 @@ SESSION_INFO_FILE = "session_info.json"
 def _session_rel(store: Store, session_path) -> str:
     """Store path (POSIX, relative to the server root) of a session folder."""
     return Path(session_path).relative_to(store.local_path("")).as_posix()
+
+
+@delta("session_info.packing_progress")
+def _apply_progress(session_info, *, packing_list_name, status, completed_orders, timestamp):
+    """Record one list's progress. `timestamp` is when the packer made the change, so a replay keeps it."""
+    if session_info is None:
+        raise StoreNotFound(SESSION_INFO_FILE)
+
+    if 'packing_progress' not in session_info:
+        session_info['packing_progress'] = {}
+
+    block = session_info['packing_progress'].setdefault(
+        packing_list_name, {'started_at': timestamp}
+    )
+    block['status'] = status
+    block['updated_at'] = timestamp
+
+    if completed_orders:
+        merged = list(block.get('completed_orders', []))
+        merged.extend(o for o in completed_orders if o not in merged)
+        block['completed_orders'] = merged
+    return session_info
 
 
 class SessionManager:
@@ -115,34 +137,16 @@ class SessionManager:
         """
         try:
             rel = f"{_session_rel(self.store, session_path)}/{SESSION_INFO_FILE}"
-            if not self.store.exists(rel):
-                logger.warning(f"session_info.json not found: {session_path}")
-                return
-
-            def edit(session_info):
-                if session_info is None:  # removed since the check above
-                    raise StoreNotFound(rel)
-
-                if 'packing_progress' not in session_info:
-                    session_info['packing_progress'] = {}
-
-                block = session_info['packing_progress'].setdefault(
-                    packing_list_name, {'started_at': get_current_timestamp()}
-                )
-                block['status'] = status
-                block['updated_at'] = get_current_timestamp()
-
-                if completed_orders:
-                    merged = list(block.get('completed_orders', []))
-                    merged.extend(o for o in completed_orders if o not in merged)
-                    block['completed_orders'] = merged
-                return session_info
+            progress = Delta("session_info.packing_progress", {
+                "packing_list_name": packing_list_name, "status": status,
+                "completed_orders": completed_orders, "timestamp": get_current_timestamp(),
+            })
 
             # The Shopify tool guards this same file with an exclusive lock on the
             # sidecar .lock (its SessionManager._locked_session_info). update_json
             # holds that lock for the read and the write, so neither side's
-            # order numbers are silently dropped.
-            self.store.update_json(rel, edit)
+            # order numbers are silently dropped. A missing file raises StoreNotFound.
+            self.store.update_json(rel, progress)
 
             logger.info(f"Updated session metadata: {packing_list_name} -> {status}")
 

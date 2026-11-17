@@ -9,7 +9,7 @@ import json
 import logging
 from dataclasses import asdict, dataclass
 
-from shared.store import Store, StoreError, StoreNotFound
+from shared.store import Delta, Store, StoreError, StoreNotFound, delta
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +20,32 @@ REGISTRY_VERSION = "1.3.0"
 
 class _NoSuchWorker(Exception):
     """Raised inside an update to end it without writing the registry."""
+
+
+@delta("workers.update_stats")
+def _apply_stats(data, *, worker_id, sessions, orders, items, duration_seconds, session_id, timestamp):
+    """Add one session's counts to a worker. `timestamp` is when the packer finished, so a replay keeps it."""
+    data = {"workers": []} if data is None else data
+    worker_dict = next((w for w in data.get('workers', []) if w['id'] == worker_id), None)
+    if worker_dict is None:
+        raise _NoSuchWorker(worker_id)
+
+    worker_dict['total_sessions'] = worker_dict.get('total_sessions', 0) + sessions
+    worker_dict['total_orders'] = worker_dict.get('total_orders', 0) + orders
+    worker_dict['total_items'] = worker_dict.get('total_items', 0) + items
+    worker_dict['total_duration_seconds'] = worker_dict.get('total_duration_seconds', 0) + duration_seconds
+    worker_dict['last_active'] = timestamp
+    if session_id:
+        worker_dict['last_session_id'] = session_id
+    worker_dict['version'] = REGISTRY_VERSION
+
+    # Recalculate averages using WorkerProfile
+    worker = WorkerProfile.from_dict(worker_dict)
+    worker.recalculate_averages()
+    worker_dict.update(worker.to_dict())
+
+    data["version"] = REGISTRY_VERSION
+    return data
 
 
 @dataclass
@@ -167,6 +193,10 @@ class WorkerManager:
             data["version"] = REGISTRY_VERSION
             return data
 
+        return self._commit_registry(edit)
+
+    def _commit_registry(self, edit) -> dict:
+        """update_json on workers.json (edit is a fn(doc) -> doc, or a Delta), with corrupt-file recovery."""
         try:
             return self.store.update_json(REGISTRY, edit)
         except StoreError as e:
@@ -302,38 +332,13 @@ class WorkerManager:
         """
         from shared.metadata_utils import get_current_timestamp
 
-        now = get_current_timestamp()
-        worker = None
-
-        def add(data):
-            nonlocal worker
-            for worker_dict in data.get('workers', []):
-                if worker_dict['id'] == worker_id:
-                    # Increment aggregate counters
-                    worker_dict['total_sessions'] = worker_dict.get('total_sessions', 0) + sessions
-                    worker_dict['total_orders'] = worker_dict.get('total_orders', 0) + orders
-                    worker_dict['total_items'] = worker_dict.get('total_items', 0) + items
-                    worker_dict['total_duration_seconds'] = worker_dict.get('total_duration_seconds', 0) + duration_seconds
-
-                    # Update activity tracking
-                    worker_dict['last_active'] = now
-                    if session_id:
-                        worker_dict['last_session_id'] = session_id
-
-                    # Ensure version field exists
-                    worker_dict['version'] = REGISTRY_VERSION
-
-                    # Recalculate averages using WorkerProfile
-                    worker = WorkerProfile.from_dict(worker_dict)
-                    worker.recalculate_averages()
-
-                    # Update dict with recalculated values
-                    worker_dict.update(worker.to_dict())
-                    return
-            raise _NoSuchWorker(worker_id)
-
+        stats = Delta("workers.update_stats", {
+            "worker_id": worker_id, "sessions": sessions, "orders": orders, "items": items,
+            "duration_seconds": duration_seconds, "session_id": session_id,
+            "timestamp": get_current_timestamp(),
+        })
         try:
-            self._update_registry(add)
+            self._commit_registry(stats)
         except _NoSuchWorker:
             logger.warning(f"Worker not found for stats update: {worker_id}")
             return
@@ -341,6 +346,6 @@ class WorkerManager:
         logger.info(
             f"Updated stats for {worker_id}: "
             f"+{sessions} sessions, +{orders} orders, +{items} items, "
-            f"+{duration_seconds}s duration (avg {worker.avg_time_per_order}s/order)"
+            f"+{duration_seconds}s duration"
         )
 
