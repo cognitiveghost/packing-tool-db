@@ -1007,11 +1007,7 @@ class MainWindow(QMainWindow):
             try:
                 if self._renew_lock(work_dir):
                     self._heartbeat_lost.emit(str(work_dir))  # queued to the UI thread
-                store = self.profile_manager.store
-                if isinstance(store, BufferedStore) and not store.online:
-                    res = store.flush()
-                    if res.conflict_rel:
-                        self._offline_conflict.emit(res.conflict_rel)
+                # The offline flush is no longer here: the sync driver (P8) runs it.
             finally:
                 self._heartbeat_busy = False
 
