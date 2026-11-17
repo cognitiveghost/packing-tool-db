@@ -401,6 +401,70 @@ def test_derived_mode_a_failed_listing_raises_rather_than_reading_empty(derived,
         derived.read_registry("M")
 
 
+class _CallLog:
+    """Wraps a store and records the name of every method called through it."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.calls = []
+
+    def __getattr__(self, name):
+        attr = getattr(self._inner, name)
+        if not callable(attr):
+            return attr
+
+        def call(*args, **kwargs):
+            self.calls.append(name)
+            return attr(*args, **kwargs)
+
+        return call
+
+
+def test_derived_read_makes_one_overview_query(derived, profile_manager):
+    session_dir = _session_tree(profile_manager, "2026-10-01_1", ["DHL_Orders", "L"])
+    _work_dir(session_dir, "DHL_Orders", state=STATE)
+    done_dir = _session_tree(profile_manager, "2026-10-02_1", ["DPD_Orders"])
+    _work_dir(done_dir, "DPD_Orders", summary={"total_orders": 1, "completed_orders": 1})
+    spy = _CallLog(profile_manager.store)
+    profile_manager.store = spy
+
+    entries = derived.get_all_entries("M")
+
+    assert {(e["packing_list_name"], e["status"]) for e in entries} == {
+        ("DHL_Orders", "paused"), ("DPD_Orders", "completed"), ("L", "not_started")}
+    assert spy.calls.count("packing_overview") == 1
+    assert set(spy.calls) <= {"packing_overview", "local_path"}
+
+
+def test_derived_overview_error_propagates(derived, profile_manager, monkeypatch):
+    _session_tree(profile_manager, "2026-10-01_1", ["L"])
+
+    def overview(client_id):
+        raise StoreError(client_id)
+
+    monkeypatch.setattr(profile_manager.store, "packing_overview", overview)
+    with pytest.raises(StoreError):
+        derived.read_registry("M")
+
+
+def test_derived_and_file_scan_agree(registry, profile_manager):
+    session_dir = _session_tree(profile_manager, "2026-10-01_1", ["DHL_Orders", "L"])
+    _lock(_work_dir(session_dir, "DHL_Orders", state=STATE), age_seconds=10)
+    done_dir = _session_tree(profile_manager, "2026-10-02_1", ["DPD_Orders"])
+    _work_dir(done_dir, "DPD_Orders", summary={"total_orders": 1, "completed_orders": 1})
+
+    def comparable(rebuilt):
+        available = {k: {f: v for f, v in e.items() if f != "mtime"}
+                     for k, e in rebuilt["available_lists"].items()}
+        return rebuilt["sessions"], available
+
+    file_scan = comparable(registry.build_from_scan("M"))
+    profile_manager.store = _DerivedStore(profile_manager.store.root)
+    derived_scan = comparable(registry.build_from_scan("M"))
+    assert derived_scan == file_scan
+    assert file_scan[0] and file_scan[1]
+
+
 @pytest.mark.parametrize(("age_seconds", "status"), [
     (10, "in_progress"),
     (SessionLockManager.STALE_TIMEOUT + 10, "stale"),

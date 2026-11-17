@@ -56,6 +56,82 @@ def _rel(store: Store, path) -> str:
     return Path(path).relative_to(store.local_path("")).as_posix()
 
 
+def _started_entry(session_id, list_name, *, summary, state, locked, has_info, info_pc, work_dir, session_dir):
+    """Registry entry of a started list, or None when neither a summary nor a state describes it.
+
+    A summary wins over a state. `locked`: the work folder holds a lock. `has_info`: the session
+    has session_info.json. `info_pc`: the session's pc_name, or the local default.
+    """
+    if summary is not None:
+        total_orders = summary.get("total_orders", 0)
+        completed_orders = summary.get("completed_orders", 0)
+        all_done = total_orders > 0 and completed_orders == total_orders
+        return {
+            "session_id": session_id,
+            "packing_list_name": list_name,
+            "status": "completed" if all_done else "incomplete",
+            "worker_id": summary.get("worker_id"),
+            "worker_name": summary.get("worker_name"),
+            "pc_name": summary.get("pc_name", info_pc),
+            "started_at": summary.get("started_at", ""),
+            "last_updated": summary.get("completed_at", ""),
+            "completed_at": summary.get("completed_at"),
+            "duration_seconds": summary.get("duration_seconds"),
+            "total_orders": total_orders,
+            "completed_orders": completed_orders,
+            "skipped_orders": summary.get("skipped_orders_count", 0),
+            "total_items": summary.get("total_items", 0),
+            "work_dir": str(work_dir),
+            "session_path": str(session_dir),
+            "metrics": summary.get("metrics"),
+        }
+    if state is not None:
+        progress = state.get("progress", {})
+        if locked:
+            status = "in_progress"
+        elif has_info:
+            status = "paused"
+        else:
+            status = "incomplete"
+        return {
+            "session_id": session_id,
+            "packing_list_name": list_name,
+            "status": status,
+            "worker_id": state.get("worker_id"),
+            "worker_name": state.get("worker_name"),
+            "pc_name": state.get("pc_name", info_pc),
+            "started_at": state.get("started_at", ""),
+            "last_updated": state.get("last_updated", ""),
+            "completed_at": None,
+            "duration_seconds": None,
+            "total_orders": progress.get("total_orders", 0),
+            "completed_orders": progress.get("completed_orders", 0),
+            "skipped_orders": len(state.get("skipped_orders", [])),
+            "total_items": progress.get("total_items", 0),
+            "work_dir": str(work_dir),
+            "session_path": str(session_dir),
+            "metrics": None,
+        }
+    return None
+
+
+def _available_entry(session_id, list_name, doc, pl_file, session_dir, mtime):
+    """Registry entry of a packing list nobody has started. `doc` is the list document (trimmed in derived mode)."""
+    # Courier may be under different keys depending on Shopify tool version
+    courier = doc.get("courier") or doc.get("filters_applied", {}).get("courier", "")
+    return {
+        "session_id": session_id,
+        "packing_list_name": list_name,
+        "packing_list_path": str(pl_file),
+        "session_path": str(session_dir),
+        "courier": courier,
+        "created_at": doc.get("created_at", ""),
+        "total_orders": doc.get("total_orders", len(doc.get("orders", []))),
+        "total_items": doc.get("total_items", 0),
+        "mtime": mtime,
+    }
+
+
 class SessionRegistryManager:
     """
     Manages per-client registry_index.json files on the network file server.
@@ -218,16 +294,17 @@ class SessionRegistryManager:
 
     def build_from_scan(self, client_id: str) -> dict:
         """
-        Walk the Sessions/CLIENT_{id}/ directory tree and build a registry.
+        Build the client's registry.
 
-        In file mode this is only called once per client as a migration step
-        when no registry_index.json exists. In derived mode it runs on every read.
+        File mode walks the Sessions/CLIENT_{id}/ directory tree. This is only
+        called once per client as a migration step when no registry_index.json
+        exists. Derived mode reads one packing_overview on every read.
         """
-        # ponytail: derived mode walks every session over HTTP (several requests each, plus a
-        # download of every unstarted list) on each read; replace with one Store query over
-        # packing_lists / packing_state / list_locks before the trial goes live (owner, run 123).
         registry = self._empty_registry(client_id)
         store = self.profile_manager.store
+        if store.derived_indexes:
+            self._add_from_overview(registry, client_id)
+            return registry
         client_rel = f"Sessions/CLIENT_{client_id}"
 
         if not store.exists(client_rel):
@@ -257,6 +334,30 @@ class SessionRegistryManager:
             f"{len(registry['available_lists'])} available lists"
         )
         return registry
+
+    def _add_from_overview(self, registry: dict, client_id: str):
+        """Fill registry from the Store's packing_overview (derived mode). A StoreError propagates."""
+        store = self.profile_manager.store
+        default_pc = os.environ.get("COMPUTERNAME", "Unknown")
+        root = store.local_path("")  # joined, not local_path(rel): a dot in a list name would route it as a blob
+        for row in store.packing_overview(client_id):
+            session, list_name = row["session_name"], row["list_name"]
+            session_dir = root / "Sessions" / f"CLIENT_{client_id}" / session
+            info = row["session_info"]
+            pc_name = default_pc if info is None or info.get("pc_name") is None else info["pc_name"]
+            key = self._session_key(session, list_name)
+            if row["started"] or row["packing_list"] is None:  # legacy barcodes/ rows have no list document
+                entry = _started_entry(
+                    session, list_name, summary=row["summary"], state=row["state"],
+                    locked=row["lock"] is not None, has_info=info is not None, info_pc=pc_name,
+                    work_dir=root / row["work_rel"], session_dir=session_dir,
+                )
+                if entry is not None:
+                    registry["sessions"][key] = entry
+            else:
+                pl_file = session_dir / "packing_lists" / f"{list_name}.json"
+                registry["available_lists"][key] = _available_entry(
+                    session, list_name, row["packing_list"], pl_file, session_dir, None)
 
     def _scan_session_dir(
         self,
@@ -330,79 +431,41 @@ class SessionRegistryManager:
         state_rel = f"{work_rel}/packing_state.json"
         info_rel = f"{_rel(store, session_dir)}/session_info.json"
         pc_name = os.environ.get("COMPUTERNAME", "Unknown")
+        has_info = store.exists(info_rel)
 
         # Read session_info for basic metadata
-        session_info = {}
-        if store.exists(info_rel):
+        if has_info:
             try:
-                session_info = store.read_json(info_rel)
-                pc_name = session_info.get("pc_name", pc_name)
+                pc_name = store.read_json(info_rel).get("pc_name", pc_name)
             except Exception as info_exc:
                 logger.debug(f"Could not read pc_name from {info_rel}: {info_exc}")
 
+        # A summary that reads and builds an entry wins; otherwise the state decides.
+        # Either failing falls through to the next source, as it always has.
+        entry = None
         if store.exists(summary_rel):
             try:
-                summary = store.read_json(summary_rel)
-                total_orders = summary.get("total_orders", 0)
-                completed_orders = summary.get("completed_orders", 0)
-                all_done = total_orders > 0 and completed_orders == total_orders
-                registry["sessions"][key] = {
-                    "session_id": session_id,
-                    "packing_list_name": packing_list_name,
-                    "status": "completed" if all_done else "incomplete",
-                    "worker_id": summary.get("worker_id"),
-                    "worker_name": summary.get("worker_name"),
-                    "pc_name": summary.get("pc_name", pc_name),
-                    "started_at": summary.get("started_at", ""),
-                    "last_updated": summary.get("completed_at", ""),
-                    "completed_at": summary.get("completed_at"),
-                    "duration_seconds": summary.get("duration_seconds"),
-                    "total_orders": total_orders,
-                    "completed_orders": completed_orders,
-                    "skipped_orders": summary.get("skipped_orders_count", 0),
-                    "total_items": summary.get("total_items", 0),
-                    "work_dir": str(work_dir),
-                    "session_path": str(session_dir),
-                    "metrics": summary.get("metrics"),
-                }
-                return
+                entry = _started_entry(
+                    session_id, packing_list_name, summary=store.read_json(summary_rel), state=None,
+                    locked=False, has_info=has_info, info_pc=pc_name, work_dir=work_dir, session_dir=session_dir,
+                )
             except Exception as e:
                 logger.debug(f"Could not read summary {summary_rel}: {e}")
 
-        if store.exists(state_rel):
+        if entry is None and store.exists(state_rel):
             try:
                 state = store.read_json(state_rel)
-                progress = state.get("progress", {})
-
                 # MainWindow locks the work folder (packing/<list>/), not the session folder.
-                if store.lock_info(work_rel) is not None:
-                    status = "in_progress"
-                elif store.exists(info_rel):
-                    status = "paused"
-                else:
-                    status = "incomplete"
-
-                registry["sessions"][key] = {
-                    "session_id": session_id,
-                    "packing_list_name": packing_list_name,
-                    "status": status,
-                    "worker_id": state.get("worker_id"),
-                    "worker_name": state.get("worker_name"),
-                    "pc_name": state.get("pc_name", pc_name),
-                    "started_at": state.get("started_at", ""),
-                    "last_updated": state.get("last_updated", ""),
-                    "completed_at": None,
-                    "duration_seconds": None,
-                    "total_orders": progress.get("total_orders", 0),
-                    "completed_orders": progress.get("completed_orders", 0),
-                    "skipped_orders": len(state.get("skipped_orders", [])),
-                    "total_items": progress.get("total_items", 0),
-                    "work_dir": str(work_dir),
-                    "session_path": str(session_dir),
-                    "metrics": None,
-                }
+                locked = store.lock_info(work_rel) is not None
+                entry = _started_entry(
+                    session_id, packing_list_name, summary=None, state=state,
+                    locked=locked, has_info=has_info, info_pc=pc_name, work_dir=work_dir, session_dir=session_dir,
+                )
             except Exception as e:
                 logger.debug(f"Could not read state {state_rel}: {e}")
+
+        if entry is not None:
+            registry["sessions"][key] = entry
 
     def _mtime(self, pl_file: Path) -> float | None:
         """Change key refresh_available_lists compares: seconds in file mode, None when derived.
@@ -428,24 +491,9 @@ class SessionRegistryManager:
         try:
             mtime = self._mtime(pl_file)  # before the read: a rewrite mid-read is re-read next time
             pl_data = store.read_json(_rel(store, pl_file))
-            # Courier may be under different keys depending on Shopify tool version
-            courier = (
-                pl_data.get("courier")
-                or pl_data.get("filters_applied", {}).get("courier", "")
+            registry["available_lists"][key] = _available_entry(
+                session_id, packing_list_name, pl_data, pl_file, session_dir, mtime
             )
-            registry["available_lists"][key] = {
-                "session_id": session_id,
-                "packing_list_name": packing_list_name,
-                "packing_list_path": str(pl_file),
-                "session_path": str(session_dir),
-                "courier": courier,
-                "created_at": pl_data.get("created_at", ""),
-                "total_orders": pl_data.get(
-                    "total_orders", len(pl_data.get("orders", []))
-                ),
-                "total_items": pl_data.get("total_items", 0),
-                "mtime": mtime,
-            }
         except Exception as e:
             logger.debug(f"Could not read packing list {pl_file}: {e}")
 

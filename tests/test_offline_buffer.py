@@ -180,6 +180,20 @@ def test_list_dir_is_still_the_store_method(inner, tmp_path):
     assert "packing_state.json" in make(inner, tmp_path).list_dir(LIST)
 
 
+def test_packing_overview_forwards_and_marks_lost_on_error(inner, tmp_path, monkeypatch):
+    b = make(inner, tmp_path)
+    monkeypatch.setattr(inner, "packing_overview", lambda client_id: [{"list_name": "DHL", "c": client_id}])
+    assert b.packing_overview("M") == [{"list_name": "DHL", "c": "M"}]
+
+    def down(client_id):
+        raise StoreError("network")
+
+    monkeypatch.setattr(inner, "packing_overview", down)
+    with pytest.raises(StoreError, match="network"):
+        b.packing_overview("M")
+    assert b.online is False
+
+
 def test_append_after_torn_tail_keeps_later_writes(inner, tmp_path):
     b = make(inner, tmp_path)
     inner.down = True
