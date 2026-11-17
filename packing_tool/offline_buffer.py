@@ -104,7 +104,12 @@ class BufferedStore(Store):
         ops = self._ops()
         # The outbox is the truth; state/ is its read cache. Rebuild it, so a kill between
         # the two writes, or a half-done clear, never serves a value the outbox lacks.
+        # A blob exists only in state/ (the outbox names it), so carry it across the rebuild.
+        blobs = {op["blob_file"]: self._state.read_bytes(op["blob_file"])
+                 for op in ops if op["op"] == "write_bytes" and self._state.exists(op["blob_file"])}
         shutil.rmtree(self.buffer_dir / "state", ignore_errors=True)
+        for rel, blob in blobs.items():
+            self._state.write_bytes(rel, blob)
         for op in ops:
             if op["op"] in ("write_json", "update_json_result"):
                 self._state.write_json(op["rel"], op["data"])

@@ -201,3 +201,16 @@ def test_conflict_parks_deltas_unapplied(tmp_path):
     ]
     assert server.read_json(STATS) == {"total_sessions": 2}
     assert BufferedStore.pending(buf) is None
+
+
+def test_pending_blob_survives_restart(tmp_path):
+    inner = FlakyStore(tmp_path / "srv")
+    buf = tmp_path / "buf"
+    b = BufferedStore(inner, buf, pc="PC1")
+    b.begin_list("Sessions/CLIENT_M/s/packing/L", {}, [])
+    inner.down = True
+    b.write_bytes("Sessions/CLIENT_M/s/packing/L/report.bin", b"xyz")
+    b2 = BufferedStore(inner, buf, pc="PC1")
+    inner.down = False
+    assert b2.flush().error is None
+    assert inner.read_bytes("Sessions/CLIENT_M/s/packing/L/report.bin") == b"xyz"
