@@ -9,7 +9,14 @@ import json
 import logging
 from dataclasses import asdict, dataclass
 
-from shared.store import Delta, Store, StoreError, StoreNotFound, delta
+from shared.store import (
+    Delta,
+    Store,
+    StoreError,
+    StoreNotFound,
+    StoreUnreachable,
+    delta,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +149,8 @@ class WorkerManager:
         try:
             self.store.claim_dir("Workers")
             logger.debug(f"Workers directory ready: {self.workers_dir}")
+        except StoreUnreachable:
+            logger.warning("Workers directory not verified: database unreachable")  # offline start
         except Exception:
             logger.exception("Failed to create Workers directory")
             raise

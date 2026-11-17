@@ -467,10 +467,23 @@ def _unreachable(name: str):
 
 
 class UnreachableStore(Store):
-    """The Store before a database sign-in: every call is a network failure, so writes queue."""
+    """The Store before a database sign-in: every call is a network failure, so writes queue.
+
+    Its local tree is the database cache when one is given (as SupabaseStore's), so a
+    ProfileManager and the packing list can be built over it while offline.
+    """
 
     derived_indexes = True
 
+    def __init__(self, cache_dir: Path | None = None):
+        self._cache = None if cache_dir is None else Path(cache_dir)
+
+    def local_path(self, rel: str = ""):
+        if self._cache is None:
+            raise StoreUnreachable("database not connected")
+        return self._cache / rel
+
 
 for _name in _STORE_METHODS:
-    setattr(UnreachableStore, _name, _unreachable(_name))
+    if _name != "local_path":
+        setattr(UnreachableStore, _name, _unreachable(_name))

@@ -84,7 +84,7 @@ from shared.server_connection import (
 )
 from shared.session_id import derive_session_id
 from shared.stats_manager import StatsManager
-from shared.store import SESSION_INFO, StoreError
+from shared.store import SESSION_INFO, StoreError, StoreUnreachable
 from shared.store_mode import Mode, open_store
 from shared.theme import (
     theme_notifier,
@@ -160,6 +160,11 @@ def _under_pytest() -> bool:
 def _offline_buffer_dir() -> Path:
     base = QStandardPaths.writableLocation(QStandardPaths.AppLocalDataLocation)
     return Path(base) / "PackingTool-DB" / "buffer"
+
+
+def _db_cache_dir() -> Path:
+    """The local tree of the database store: the Supabase cache, and the offline run's too."""
+    return Path(os.path.expanduser("~")) / ".packers_assistant" / "db_cache"
 
 
 def _store_rel(store, path) -> str:
@@ -326,6 +331,7 @@ class MainWindow(QMainWindow):
 
         # Load available clients and restore last selected
         self.load_available_clients()
+        self._start_from_outbox()
 
         if not self._is_test_mode:
             # The first thing a packer sees: who is packing (spec 2026-10-09,
@@ -815,6 +821,10 @@ class MainWindow(QMainWindow):
 
             logger.info(f"Loaded {len(clients)} clients")
 
+        except StoreUnreachable:
+            # Offline start: no client list, and no dialog. An offline list reopens from the buffer.
+            logger.warning("Clients not listed: database unreachable")
+
         except Exception as e:
             logger.exception("Error loading clients")
             QMessageBox.warning(
@@ -1037,7 +1047,7 @@ class MainWindow(QMainWindow):
         mode, store = open_store(
             "PackingTool-DB",
             fallback_root=fallback_root,
-            cache_dir=Path(os.path.expanduser("~")) / ".packers_assistant" / "db_cache",
+            cache_dir=_db_cache_dir(),
             prompt=lambda error: SignInDialog.ask(self, error),
             outbox_pending=pending is not None,
         )
@@ -1050,17 +1060,10 @@ class MainWindow(QMainWindow):
             self._startup_sync_error = self._run_store.sync_error
             return ProfileManager(config_path, store=self._run_store)
         if mode is Mode.OFFLINE_BUFFER:
-            # The run's store over no backend. ProfileManager cannot be built over it (its __init__
-            # reads local_path), so P7 opens the list from list.json here; until then, as before.
-            self._run_store = BufferedStore(UnreachableStore(), buffer_dir, pc=pc)
-            # Never the file share: that progress belongs to the database. Reconnect to sync it.
-            raise ProfileManagerError(
-                _(
-                    "This PC has unsynced progress for {list_name} and the database is "
-                    "unreachable. Reconnect and start the app again to sync it.",
-                    list_name=pending.rsplit("/", 1)[-1],
-                )
-            )
+            # The run's store over no backend, its local tree the database cache. Never the file
+            # share: that progress belongs to the database. _start_from_outbox picks the start.
+            self._run_store = BufferedStore(UnreachableStore(_db_cache_dir()), buffer_dir, pc=pc)
+            return ProfileManager(config_path, store=self._run_store)
         if mode is Mode.FILE:
             self._db_fallback = True  # _init_ui shows the banner that says so
         return ProfileManager(config_path)
@@ -1088,6 +1091,63 @@ class MainWindow(QMainWindow):
             _("Offline progress kept aside"),
             _("Another PC took this list while you were offline. Your progress is saved as {file}.", file=rel),
         )
+
+    def _start_from_outbox(self) -> None:
+        """A pending outbox decides the start (spec §8.3). Never the file share.
+
+        A permanent sync error, a finished list, or an outbox with no list.json (written before B2)
+        shows the waiting-to-sync screen. An unfinished list with the database still down reopens.
+        """
+        store = self._run_store
+        if store is None:
+            return
+        buffer_dir = _offline_buffer_dir()
+        pending = BufferedStore.pending(buffer_dir)
+        if pending is None:
+            return
+        meta = BufferedStore.pending_meta(buffer_dir)
+        if self._startup_sync_error or meta is None or store.finished():
+            self._show_waiting_to_sync(pending.rsplit("/", 1)[-1], self._startup_sync_error)
+        elif isinstance(store.inner, UnreachableStore):
+            self._resume_offline_list(meta)
+
+    def _resume_offline_list(self, meta: dict) -> None:
+        """Reopen the unfinished list from the buffer, offline. No lock acquire: the flush checks
+        ownership. The binding is already there from list.json, so no begin_list and no heartbeat.
+        """
+        from packing_tool.packer_logic import PackerLogic
+
+        store = self._run_store
+        client_id = meta["client_id"]
+        session_rel = f"Sessions/CLIENT_{client_id}/{meta['session_name']}"
+        work_dir = store.local_path(meta["work_dir_rel"])
+        self.current_client_id = client_id
+        self.current_worker_id = meta["worker_id"]
+        self.current_worker_name = meta["worker_name"]
+        self.current_session_path = str(store.local_path(session_rel))
+        self.current_packing_list = meta["list_name"]
+        self.current_work_dir = str(work_dir)
+        self.session_manager = SessionManager(client_id=client_id, store=store)
+        self.logic = PackerLogic(client_id=client_id, profile_manager=self.profile_manager, work_dir=str(work_dir))
+        order_count, list_name = self.logic.load_packing_list_json(
+            store.local_path(f"{session_rel}/packing_lists/{meta['list_name']}.json")
+        )
+        self.logic.item_packed.connect(self._on_item_packed)
+        self.logic.all_orders_complete.connect(self._on_all_orders_complete)
+        self.logic.save_failed.connect(self.packer_mode_widget.set_unsaved)
+        self.packing_data = {"list_name": list_name, "total_orders": order_count, "orders": []}
+        index = self.client_combo.findData(client_id)
+        if index >= 0:
+            self.client_combo.blockSignals(True)
+            self.client_combo.setCurrentIndex(index)
+            self.client_combo.blockSignals(False)
+        self.session_tabs.setCurrentIndex(PAGE_PACKING)
+        self._open_packer_document()
+        self.enable_packing_mode()
+
+    def _show_waiting_to_sync(self, list_name: str, error: str | None) -> None:
+        """The waiting-to-sync screen. Only its state for now: P8 builds the page."""
+        self.waiting_list = (list_name, error)
 
     @property
     def buffered_store(self) -> BufferedStore | None:

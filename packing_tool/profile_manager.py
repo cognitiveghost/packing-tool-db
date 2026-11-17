@@ -16,7 +16,7 @@ from pathlib import Path
 
 from shared.logger import setup_logging
 from shared.server_connection import resolve_server_path, test_path_reachable
-from shared.store import FileStore, Store, StoreError
+from shared.store import FileStore, Store, StoreError, StoreUnreachable
 
 logger = logging.getLogger(__name__)
 
@@ -176,6 +176,9 @@ class ProfileManager:
             for rel in ("Clients", "Sessions", "Workers", "Stats", "Logs"):
                 self.store.claim_dir(rel)
             logger.debug("Directory structure verified")
+        except StoreUnreachable:
+            # An offline start (spec §8.3): the folders are on the server already, or made on reconnect.
+            logger.warning("Directory structure not verified: database unreachable")
         except Exception as e:
             logger.exception("Cannot create directories")
             raise ProfileManagerError(f"Cannot create directories on file server: {e}")

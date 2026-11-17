@@ -348,7 +348,6 @@
   "There’s already a worker called {name}. Pick that card, or add a surname.": "Вече има работник на име {name}. Изберете тази карта или добавете фамилно име.",
   "This PC has offline progress that is not synced yet. Reconnect before starting another list.": "Този компютър има офлайн напредък, който още не е синхронизиран. Свържете се отново, преди да започнете друг списък.",
   "This PC has stopped packing it so the two don't overwrite each other's progress. Orders packed here up to now are saved.": "Този компютър спря опаковането, за да не се презаписват взаимно напредъкът на двата. Поръчките, опаковани тук досега, са запазени.",
-  "This PC has unsynced progress for {list_name} and the database is unreachable. Reconnect and start the app again to sync it.": "Този компютър има несинхронизиран напредък за {list_name}, а базата данни не е достъпна. Свържете се отново и стартирайте приложението, за да го синхронизирате.",
   "This barcode already maps to": "Този баркод вече е свързан със",
   "This barcode already maps to {sku}.": "Този баркод вече е свързан с {sku}.",
   "This list is open on another PC": "Списъкът е отворен на друг компютър",
