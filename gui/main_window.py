@@ -72,6 +72,7 @@ from packing_tool.worker_manager import WorkerManager
 from shared.components.language_segment import switch_language
 from shared.components.sign_in_dialog import SignInDialog
 from shared.components.toast import toast
+from shared.db_auth import SignInCancelled
 from shared.fonts import load_bundled_fonts
 from shared.guide.help import open_guide
 from shared.i18n import N_, _, _n
@@ -218,6 +219,7 @@ class MainWindow(QMainWindow):
 
         # Initialize ProfileManager, offering a path-recovery prompt on
         # NetworkError instead of exiting immediately.
+        self._db_fallback = False
         while True:
             try:
                 self.profile_manager = self._open_profile_manager(config_path)
@@ -229,6 +231,14 @@ class MainWindow(QMainWindow):
                 if prompt_for_recovery_path(self, str(e), "PackingTool-DB"):
                     continue
                 sys.exit(1)
+            except SignInCancelled:
+                # Not an outage: a window without a store is no use. Say why, and quit.
+                QMessageBox.information(
+                    self,
+                    _("Not signed in"),
+                    _("The app needs a sign-in to start. Open it again to sign in."),
+                )
+                sys.exit(0)
             except Exception as e:
                 logger.exception("Unexpected error initializing ProfileManager")
                 QMessageBox.critical(
@@ -439,10 +449,19 @@ class MainWindow(QMainWindow):
         # on a container, so hiding it leaves no gap above the page.
         self.connection_banner = ConnectionBanner()
         self.connection_banner.retryRequested.connect(self.check_connection)
+        # The database failed at startup and this run works from the file share. Persistent
+        # until restart: the run cannot switch stores (spec section 7).
+        self.file_fallback_banner = ConnectionBanner()
+        self.file_fallback_banner.set_notice(
+            _("Database unreachable: working from file server"),
+            _("Changes save to the file server. Restart the app to try the database again."),
+        )
+        self.file_fallback_banner.setVisible(self._db_fallback)
         self._banner_row = QWidget()
         banner_layout = QVBoxLayout(self._banner_row)
         banner_layout.setContentsMargins(24, 20, 24, 0)
         banner_layout.addWidget(self.connection_banner)
+        banner_layout.addWidget(self.file_fallback_banner)
         main_layout.addWidget(self._banner_row)
 
         main_layout.addWidget(self.session_tabs, 1)
@@ -933,7 +952,7 @@ class MainWindow(QMainWindow):
             self.connection_banner.set_outage(path, self._connection_down_since)
         # Both: the tests and the render read the banner, the layout reads the row.
         self.connection_banner.setVisible(down)
-        self._banner_row.setVisible(down)
+        self._banner_row.setVisible(down or self._db_fallback)
         self.command_bar.set_server_reachable(not down)
         self._sync_shell()
 
@@ -1017,7 +1036,7 @@ class MainWindow(QMainWindow):
             "PackingTool-DB",
             fallback_root=fallback_root,
             cache_dir=Path(os.path.expanduser("~")) / ".packers_assistant" / "db_cache",
-            prompt=lambda: SignInDialog.ask(self),
+            prompt=lambda error: SignInDialog.ask(self, error),
             outbox_pending=pending is not None,
         )
         if mode is Mode.SUPABASE:
@@ -1033,6 +1052,8 @@ class MainWindow(QMainWindow):
                     list_name=pending.rsplit("/", 1)[-1],
                 )
             )
+        if mode is Mode.FILE:
+            self._db_fallback = True  # _init_ui shows the banner that says so
         return ProfileManager(config_path)
 
     def _sync_offline_outbox(self, store, pc: str) -> bool:

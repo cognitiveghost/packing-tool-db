@@ -49,13 +49,24 @@ class ConnectionBanner(QFrame):
 
         self._path = ""
         self._since = ""
+        self._notice: tuple[str, str] | None = None
         on_theme_changed(self, self._apply_theme)
 
     def set_outage(self, server_path: str, since: str) -> None:
         self._path, self._since = server_path, since
         self._write_message()
 
+    def set_notice(self, title: str, message: str) -> None:
+        """A fixed title and message for a state with no Retry: the fallback to the file share."""
+        self._notice = (title, message)
+        self.retry_button.hide()
+        self._write_message()
+
     def _write_message(self) -> None:
+        if self._notice:
+            self.title_label.setText(self._notice[0])
+            self.message_label.setText(escape(self._notice[1]))
+            return
         mono = self._mono
         self.message_label.setText(
             _(

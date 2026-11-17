@@ -5,7 +5,7 @@ import time
 import pytest
 
 from packing_tool.offline_buffer import BufferedStore
-from shared.store import FileStore, StoreError
+from shared.store import FileStore, StoreError, StoreUnreachable
 
 LIST = "Sessions/CLIENT_M/2026-01-01_1/packing/DHL"
 STATE = f"{LIST}/packing_state.json"
@@ -14,16 +14,20 @@ STATS = "Stats/global_stats.json"
 
 
 class FlakyStore(FileStore):
-    """A FileStore whose network can be cut; the lock can be taken by another PC."""
+    """A FileStore whose network can be cut; the lock can be taken by another PC.
+
+    `broken` is a permanent refusal (a StoreError, not a network failure) for writes.
+    """
 
     def __init__(self, root):
         super().__init__(root)
         self.down = False
+        self.broken = None
         self.lock_ours = True
 
     def _check(self):
         if self.down:
-            raise StoreError("network")
+            raise StoreUnreachable("network")
 
     def read_json(self, rel):
         self._check()
@@ -31,10 +35,14 @@ class FlakyStore(FileStore):
 
     def write_json(self, rel, data):
         self._check()
+        if self.broken:
+            raise StoreError(self.broken)
         super().write_json(rel, data)
 
     def write_bytes(self, rel, data):
         self._check()
+        if self.broken:
+            raise StoreError(self.broken)
         super().write_bytes(rel, data)
 
     def exists(self, rel):
@@ -60,6 +68,24 @@ def test_online_writes_go_straight_through(inner, tmp_path):
     b.write_json(STATE, {"n": 1})
     assert inner.read_json(STATE) == {"n": 1}
     assert BufferedStore.pending(tmp_path / "buf") is None
+
+
+def test_permanent_error_is_raised_not_buffered(inner, tmp_path):
+    b = make(inner, tmp_path)
+    inner.broken = "denied"
+    with pytest.raises(StoreError) as e:
+        b.write_json(STATE, {"n": 1})
+    assert not isinstance(e.value, StoreUnreachable)
+    assert not (tmp_path / "buf" / "outbox.jsonl").exists()
+    assert b.online is True
+
+
+def test_unreachable_is_buffered(inner, tmp_path):
+    b = make(inner, tmp_path)
+    inner.down = True
+    b.write_json(STATE, {"n": 1})
+    assert len((tmp_path / "buf" / "outbox.jsonl").read_text().splitlines()) == 1
+    assert b.online is False
 
 
 def test_offline_write_lands_after_flush(inner, tmp_path):
@@ -186,7 +212,7 @@ def test_packing_overview_forwards_and_marks_lost_on_error(inner, tmp_path, monk
     assert b.packing_overview("M") == [{"list_name": "DHL", "c": "M"}]
 
     def down(client_id):
-        raise StoreError("network")
+        raise StoreUnreachable("network")
 
     monkeypatch.setattr(inner, "packing_overview", down)
     with pytest.raises(StoreError, match="network"):

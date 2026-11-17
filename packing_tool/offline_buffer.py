@@ -19,9 +19,9 @@ from shared.store import (
     SESSION_INFO,
     FileStore,
     Store,
-    StoreConflict,
     StoreError,
     StoreNotFound,
+    StoreUnreachable,
 )
 
 OUTBOX = "outbox.jsonl"
@@ -108,7 +108,7 @@ class BufferedStore(Store):
 
     def _check_allowed(self, rel: str) -> None:
         if rel not in self._allowed_exact and not rel.startswith(self.list_rel + "/"):
-            raise StoreError("offline")
+            raise StoreUnreachable("offline")
 
     def _buffer(self, op: str, rel: str, data=None, blob: bytes | None = None) -> None:
         self._check_allowed(rel)
@@ -125,8 +125,8 @@ class BufferedStore(Store):
             self.online = False  # flushed on the next heartbeat, even if a flush just ended
 
     def _lost(self, e: StoreError) -> bool:
-        """A network-ish failure: flips to offline. Not-found and conflicts are real answers."""
-        if isinstance(e, (StoreNotFound, StoreConflict)):
+        """An unreachable backend flips to offline. Any other error is a real answer."""
+        if not isinstance(e, StoreUnreachable):
             return False
         self.online = False
         return True
@@ -183,7 +183,7 @@ class BufferedStore(Store):
             except StoreNotFound:
                 current = None
             except StoreError:
-                raise StoreError("offline") from None  # never fn(None) over a state we could not read
+                raise StoreUnreachable("offline") from None  # never fn(None) over a state we could not read
             result = fn(current)
             # ponytail: replayed as a whole-document write, so on a shared doc (stats,
             # session_info) it is last-writer-wins over other PCs' edits made meanwhile. Offline
