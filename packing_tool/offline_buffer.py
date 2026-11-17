@@ -105,11 +105,12 @@ class BufferedStore(Store):
         # The outbox is the truth; state/ is its read cache. Rebuild it, so a kill between
         # the two writes, or a half-done clear, never serves a value the outbox lacks.
         # A blob exists only in state/ (the outbox names it), so carry it across the rebuild.
-        blobs = {op["blob_file"]: self._state.read_bytes(op["blob_file"])
-                 for op in ops if op["op"] == "write_bytes" and self._state.exists(op["blob_file"])}
-        shutil.rmtree(self.buffer_dir / "state", ignore_errors=True)
-        for rel, blob in blobs.items():
-            self._state.write_bytes(rel, blob)
+        # Deleted around, never read and rewritten: a kill mid-rebuild must not lose one.
+        blobs = {op["blob_file"] for op in ops if op["op"] == "write_bytes"}
+        state_root = self.buffer_dir / "state"
+        for path in list(state_root.rglob("*")) if state_root.exists() else []:
+            if path.is_file() and path.relative_to(state_root).as_posix() not in blobs:
+                path.unlink()
         for op in ops:
             if op["op"] in ("write_json", "update_json_result"):
                 self._state.write_json(op["rel"], op["data"])
@@ -211,7 +212,7 @@ class BufferedStore(Store):
         self._check_allowed(rel, delta=True)
         entry = {
             "op": "delta", "rel": rel, "list_dir": self._list_dir,
-            "kind": d.kind, "args": d.args, "op_id": d.op_id or uuid.uuid4().hex,
+            "kind": d.kind, "args": d.args, "op_id": d.op_id,
         }
         with self._mutex:
             self._append(entry)  # no state/ copy: nothing reads shared docs offline
@@ -280,6 +281,10 @@ class BufferedStore(Store):
             self._buffer("write_json", rel, data)
 
     def update_json(self, rel, fn):
+        if isinstance(fn, Delta) and fn.op_id is None:
+            # An id before the first try: a commit whose answer was lost is queued
+            # with the same id, so the flush skips it instead of counting it twice.
+            fn.op_id = uuid.uuid4().hex
         with self._mutex:
             if self.online:
                 try:

@@ -59,6 +59,7 @@ from gui.waiting_sync_page import WaitingSyncPage
 from gui.workers import SessionEndWorker, SessionStartWorker
 from packing_tool import APP_NAME, __version__
 from packing_tool.offline_buffer import BufferedStore, UnreachableStore
+from packing_tool.packer_logic import STATE_FILE_NAME
 from packing_tool.profile_manager import (
     NetworkError,
     ProfileManager,
@@ -533,7 +534,7 @@ class MainWindow(QMainWindow):
         self.stacked_widget.addWidget(self.packer_mode_widget)
         self.stacked_widget.addWidget(self.setup_pages)
         self.waiting_page = WaitingSyncPage()
-        self.waiting_page.syncRequested.connect(self._sync_tick)
+        self.waiting_page.syncRequested.connect(self._sync_now)
         self.stacked_widget.addWidget(self.waiting_page)
         # Above every page, the packing screen included: the packer always sees the outage (spec §8.4).
         self.offline_banner = ConnectionBanner()
@@ -1267,6 +1268,11 @@ class MainWindow(QMainWindow):
         finally:
             self._sync_busy = False
 
+    def _sync_now(self) -> None:
+        """The packer pressed Sync now: a sign-in cancelled earlier may be asked again."""
+        self._sign_in_declined = False
+        self._sync_tick()
+
     def _attach_database(self, prompt) -> bool:
         """Sign in to the database and swap it in under this run's store. False while unreachable."""
         client = db_auth.connect("PackingTool-DB", prompt=prompt)
@@ -1326,6 +1332,7 @@ class MainWindow(QMainWindow):
             _store_rel(store, packing_list_path),
             f"Clients/CLIENT_{client_id}/packer_config.json",
             f"{session_rel}/{SESSION_INFO}",
+            f"{work_dir_rel}/{STATE_FILE_NAME}",  # a restart with no state write queued reads this
         ]
         store.begin_list(work_dir_rel, meta, snapshot)
 

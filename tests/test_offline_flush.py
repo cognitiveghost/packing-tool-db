@@ -2,6 +2,8 @@
 
 Real managers over a FlakyStore (a FileStore whose network can be cut): spec §8.2, test 3, 4, 5, 7.
 """
+from types import SimpleNamespace
+
 import pytest
 from offline_fakes import FlakyStore
 
@@ -9,9 +11,11 @@ import packing_tool.session_manager
 import shared.metadata_utils
 import shared.stats_manager
 from packing_tool.offline_buffer import BufferedStore
+from packing_tool.session_lock_manager import SessionLockManager
 from packing_tool.session_manager import SessionManager
 from packing_tool.worker_manager import WorkerManager
 from shared.stats_manager import StatsManager
+from shared.store import StoreUnreachable
 
 CLIENT = "M"
 SESSION = "Sessions/CLIENT_M/2026-01-01_1"
@@ -214,3 +218,56 @@ def test_pending_blob_survives_restart(tmp_path):
     inner.down = False
     assert b2.flush().error is None
     assert inner.read_bytes("Sessions/CLIENT_M/s/packing/L/report.bin") == b"xyz"
+
+
+def test_online_commit_whose_answer_is_lost_counts_once(tmp_path):
+    server = FlakyStore(tmp_path / "server")
+    worker_id = seed(server)
+    b = make(server, tmp_path / "buf")
+
+    def lose_answer(rel, fn):  # the write lands; the answer never arrives
+        FlakyStore.update_json(server, rel, fn)
+        raise StoreUnreachable("read timeout")
+
+    server.update_json = lose_answer
+    StatsManager(b).record_packing(CLIENT, "s1", worker_id, 3, 9)  # queued: it looked like an outage
+    del server.update_json
+
+    assert b.flush().pushed == 1
+    assert server.read_json(STATS)["total_sessions"] == 1
+
+
+def test_replay_for_a_deleted_worker_does_not_stop_the_sync(tmp_path):
+    server = FlakyStore(tmp_path / "server")
+    worker_id = seed(server)
+    b = make(server, tmp_path / "buf")
+    server.down = True
+    finish(b, server.root, worker_id)
+    server.down = False
+    server.write_json(REGISTRY, {"workers": []})  # an admin deleted the worker meanwhile
+
+    res = b.flush()
+
+    assert res.error is None  # online this is a logged no-op, so the replay is too
+    assert res.pushed == 3
+    assert server.read_json(STATS)["total_sessions"] == 1
+
+
+def test_end_session_offline_through_the_lock_manager_queues_the_release(tmp_path):
+    server = FlakyStore(tmp_path / "server")
+    worker_id = seed(server)
+    lm = SessionLockManager(SimpleNamespace(store=None))
+    b = BufferedStore(server, tmp_path / "buf", pc=lm.hostname)
+    lm.profile_manager.store = b
+    work_dir = server.root / LIST
+    assert lm.acquire_lock(CLIENT, work_dir)[0]
+    b.begin_list(LIST, {}, [INFO])
+    server.down = True
+    finish(b, server.root, worker_id)
+
+    assert lm.release_lock(work_dir) is True  # what End session calls
+    assert b.finished()
+
+    server.down = False
+    assert b.flush().pushed == 4
+    assert server.lock_info(LIST) is None
