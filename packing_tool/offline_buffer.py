@@ -10,14 +10,17 @@ import json
 import os
 import shutil
 import threading
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from packing_tool.worker_manager import REGISTRY
 from shared.stats_manager import STATS_REL
 from shared.store import (
     SESSION_INFO,
+    Delta,
     FileStore,
     Store,
     StoreError,
@@ -101,7 +104,7 @@ class BufferedStore(Store):
         # the two writes, or a half-done clear, never serves a value the outbox lacks.
         shutil.rmtree(self.buffer_dir / "state", ignore_errors=True)
         for op in ops:
-            if op["op"] != "write_bytes":
+            if op["op"] in ("write_json", "update_json_result"):
                 self._state.write_json(op["rel"], op["data"])
         self._online = not ops  # a leftover outbox means we have not flushed yet
         self._bind(_read_meta(self.buffer_dir))
@@ -184,13 +187,28 @@ class BufferedStore(Store):
                 f.truncate(start)  # no half line for the next append to fuse with
                 raise
 
-    def _check_allowed(self, rel: str) -> None:
+    def _check_allowed(self, rel: str, *, delta: bool = False) -> None:
+        """Offline: the bound list's folder (whole documents), or a Delta on a shared doc only."""
         lst = self._list_dir
         if lst is None:
             raise StoreUnreachable("offline")
         session_info = "/".join(lst.split("/")[:3] + [SESSION_INFO])
-        if rel not in (STATS_REL, session_info) and not rel.startswith(lst + "/"):
+        if rel in (STATS_REL, REGISTRY, session_info):
+            if not delta:
+                raise StoreUnreachable("offline")  # a whole-document replay would overwrite other PCs
+            return
+        if not rel.startswith(lst + "/"):
             raise StoreUnreachable("offline")
+
+    def _queue_delta(self, rel: str, d: Delta) -> None:
+        self._check_allowed(rel, delta=True)
+        entry = {
+            "op": "delta", "rel": rel, "list_dir": self._list_dir,
+            "kind": d.kind, "args": d.args, "op_id": d.op_id or uuid.uuid4().hex,
+        }
+        with self._mutex:
+            self._append(entry)  # no state/ copy: nothing reads shared docs offline
+            self.online = False
 
     def _buffer(self, op: str, rel: str, data=None, blob: bytes | None = None) -> None:
         self._check_allowed(rel)
@@ -262,6 +280,11 @@ class BufferedStore(Store):
                 except StoreError as e:
                     if not self._lost(e):
                         raise
+            # Queued once, never applied locally too: the replay on flush applies it.
+            if isinstance(fn, Delta):
+                self._queue_delta(rel, fn)
+                return None
+            self._check_allowed(rel)  # a closure is replayed as a whole document: no shared docs
             try:
                 current = self.read_json(rel)
             except StoreNotFound:
@@ -269,9 +292,6 @@ class BufferedStore(Store):
             except StoreError:
                 raise StoreUnreachable("offline") from None  # never fn(None) over a state we could not read
             result = fn(current)
-            # ponytail: replayed as a whole-document write, so on a shared doc (stats,
-            # session_info) it is last-writer-wins over other PCs' edits made meanwhile. Offline
-            # it only runs once the doc is buffered; queue deltas if that ever becomes common.
             self._buffer("update_json_result", rel, result)
             return result
 
@@ -318,7 +338,22 @@ class BufferedStore(Store):
         return self._inner(self.inner.heartbeat_list_lock, list_dir, pc)
 
     def release_list_lock(self, list_dir, pc):
-        return self._inner(self.inner.release_list_lock, list_dir, pc)
+        with self._mutex:
+            if self.online:
+                try:
+                    return self.inner.release_list_lock(list_dir, pc)
+                except StoreError as e:
+                    if not self._lost(e):
+                        raise
+            if list_dir != self._list_dir:
+                raise StoreUnreachable("offline")
+            self._append({"op": "release_lock", "list_dir": list_dir})  # replayed on flush
+            self.online = False
+
+    def finished(self) -> bool:
+        """The list is finished: its release is queued, waiting for the flush."""
+        with self._mutex:
+            return any(op["op"] == "release_lock" for op in self._ops())
 
     def lock_info(self, list_dir):
         return self._inner(self.inner.lock_info, list_dir)
