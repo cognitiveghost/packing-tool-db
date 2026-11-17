@@ -55,6 +55,7 @@ def _write_meta(buffer_dir: Path, meta: dict) -> None:
 class FlushResult:
     pushed: int
     conflict_rel: str | None = None
+    error: str | None = None  # a permanent refusal: the outbox is kept whole, nothing skipped
 
 
 def _read_outbox(buffer_dir: Path) -> list[dict]:
@@ -92,6 +93,7 @@ class BufferedStore(Store):
         self.pc = pc
         self.derived_indexes = inner.derived_indexes
         self._on_change = on_change
+        self.sync_error: str | None = None  # why the last flush stopped on a permanent error
         self._state = FileStore(self.buffer_dir / "state")
         self._snapshot = FileStore(self.buffer_dir / SNAPSHOT)
         # The heartbeat thread flushes while the UI thread writes: an op appended mid-flush
@@ -379,57 +381,71 @@ class BufferedStore(Store):
         with self._mutex:  # no append between reading the outbox and clearing it
             ops = self._ops()
             if not ops:
+                self.sync_error = None
                 self.online = True
                 return FlushResult(0)
             list_dir = ops[0]["list_dir"]  # one outbox holds one list
             try:
                 ours = self.inner.heartbeat_list_lock(list_dir, self.pc)
-            except StoreError:
-                self.online = False
-                return FlushResult(0)
+            except StoreError as e:
+                return self._failed(0, e)
             if not ours:
                 return self._write_conflict(ops, list_dir)
-            pushed = 0
-            for op in ops:
+            # The release is replayed last, so every write under the list lands while we hold it.
+            ordered = [o for o in ops if o["op"] != "release_lock"] + [o for o in ops if o["op"] == "release_lock"]
+            for pushed, op in enumerate(ordered):
                 try:
-                    if op["op"] == "write_bytes":
-                        self.inner.write_bytes(op["rel"], self._state.read_bytes(op["blob_file"]))
-                    else:
-                        self.inner.write_json(op["rel"], op["data"])
-                except StoreError:
-                    self.online = False
-                    self._rewrite_outbox(ops[pushed:])
-                    return FlushResult(pushed)
-                pushed += 1
+                    self._replay(op)
+                except Exception as e:  # any stop keeps the outbox whole: nothing is skipped or dropped
+                    return self._failed(pushed, e)
+            finished = any(o["op"] == "release_lock" for o in ops)
             self._clear()
+            if finished:
+                self.end_list()  # the list is done: unbind it and drop its snapshot
+            self.sync_error = None
             self.online = True
-            return FlushResult(pushed)
+            return FlushResult(len(ordered))
 
-    def _rewrite_outbox(self, ops: list[dict]) -> None:
-        tmp = self.buffer_dir / (OUTBOX + ".tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.writelines(json.dumps(o) + "\n" for o in ops)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, self.buffer_dir / OUTBOX)
+    def _replay(self, op: dict) -> None:
+        kind = op["op"]
+        if kind == "write_bytes":
+            self.inner.write_bytes(op["rel"], self._state.read_bytes(op["blob_file"]))
+        elif kind == "delta":
+            # The op_id is stored in the doc it guards: a rerun after a kill skips what already landed.
+            self.inner.update_json(op["rel"], Delta.from_op(op))
+        elif kind == "release_lock":
+            self.inner.release_list_lock(op["list_dir"], self.pc)
+        else:
+            self.inner.write_json(op["rel"], op["data"])
+
+    def _failed(self, pushed: int, e: Exception) -> FlushResult:
+        """Unreachable: stay offline, retry later. Any other error: say why, and keep the outbox."""
+        self.online = False
+        if isinstance(e, StoreUnreachable):
+            return FlushResult(pushed)
+        self.sync_error = str(e) or type(e).__name__
+        return FlushResult(pushed, error=self.sync_error)
 
     def _write_conflict(self, ops: list[dict], list_dir: str) -> FlushResult:
         """Another PC took the list: park everything we buffered beside its state, overwrite nothing."""
         state: dict = {}
         blobs: dict = {}
+        deltas: list[dict] = []
         for op in ops:  # later ops win, same as a replay
             if op["op"] == "write_bytes":
                 blobs[op["rel"]] = base64.b64encode(self._state.read_bytes(op["blob_file"])).decode("ascii")
-            else:
+            elif op["op"] == "delta":
+                deltas.append({k: op[k] for k in ("rel", "kind", "args", "op_id")})  # parked, not applied
+            elif op["op"] in ("write_json", "update_json_result"):
                 state[op["rel"]] = op["data"]
         stamp = datetime.now().strftime("%Y%m%d%H%M%S")
         rel = f"{list_dir}/packing_state_conflict_{self.pc}_{stamp}.json"
         try:
-            self.inner.write_json(rel, {"pc": self.pc, "state": state, "blobs_b64": blobs})
-        except StoreError:
-            self.online = False
-            return FlushResult(0)  # outbox kept: nothing is dropped until the copy is safe
+            self.inner.write_json(rel, {"pc": self.pc, "state": state, "blobs_b64": blobs, "deltas": deltas})
+        except StoreError as e:
+            return self._failed(0, e)  # outbox kept: nothing is dropped until the copy is safe
         self._clear()
+        self.sync_error = None
         self.online = True
         return FlushResult(0, rel)
 

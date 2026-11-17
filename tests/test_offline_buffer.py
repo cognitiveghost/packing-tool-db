@@ -4,60 +4,16 @@ import threading
 import time
 
 import pytest
+from offline_fakes import FlakyStore
 
 from packing_tool.offline_buffer import BufferedStore
 from packing_tool.worker_manager import REGISTRY
-from shared.store import Delta, FileStore, StoreError, StoreUnreachable
+from shared.store import Delta, StoreError, StoreUnreachable
 
 LIST = "Sessions/CLIENT_M/2026-01-01_1/packing/DHL"
 STATE = f"{LIST}/packing_state.json"
 INFO = "Sessions/CLIENT_M/2026-01-01_1/session_info.json"
 STATS = "Stats/global_stats.json"
-
-
-class FlakyStore(FileStore):
-    """A FileStore whose network can be cut; the lock can be taken by another PC.
-
-    `broken` is a permanent refusal (a StoreError, not a network failure) for writes.
-    """
-
-    def __init__(self, root):
-        super().__init__(root)
-        self.down = False
-        self.broken = None
-        self.lock_ours = True
-
-    def _check(self):
-        if self.down:
-            raise StoreUnreachable("network")
-
-    def read_json(self, rel):
-        self._check()
-        return super().read_json(rel)
-
-    def write_json(self, rel, data):
-        self._check()
-        if self.broken:
-            raise StoreError(self.broken)
-        super().write_json(rel, data)
-
-    def write_bytes(self, rel, data):
-        self._check()
-        if self.broken:
-            raise StoreError(self.broken)
-        super().write_bytes(rel, data)
-
-    def exists(self, rel):
-        self._check()
-        return super().exists(rel)
-
-    def heartbeat_list_lock(self, list_dir, pc):
-        self._check()
-        return self.lock_ours
-
-    def release_list_lock(self, list_dir, pc):
-        self._check()
-        return super().release_list_lock(list_dir, pc)
 
 
 def outbox_ops(tmp_path):
