@@ -3,34 +3,82 @@
 from types import SimpleNamespace
 
 import pytest
+from offline_fakes import FlakyStore
 
 import gui.main_window as mw
+from packing_tool.offline_buffer import BufferedStore
 from packing_tool.profile_manager import ProfileManagerError
 from shared.db_auth import SignInCancelled
 from shared.store import FileStore
 
+LIST = "Sessions/CLIENT_M/2026-01-01_1/packing/DHL"
+STATE = f"{LIST}/packing_state.json"
 
-def test_a_pc_with_no_file_share_still_opens_the_database(monkeypatch, tmp_path):
+
+def _startup(monkeypatch, tmp_path, store, buf=None):
+    """Open the run's storage the way MainWindow does; `self` is the few attributes it reads."""
     def no_share(_config):
         raise ProfileManagerError("FileServerPath not configured")
 
-    seen = {}
-    store = FileStore(tmp_path)  # stands in for the SupabaseStore open_store returns
-
-    def fake_open_store(_app, *, fallback_root, **_kw):
-        seen["fallback_root"] = fallback_root
-        return mw.Mode.SUPABASE, store
-
     monkeypatch.setattr(mw, "_use_file_store", lambda: False)
     monkeypatch.setattr(mw, "resolve_file_server_path", no_share)
-    monkeypatch.setattr(mw, "open_store", fake_open_store)
+    monkeypatch.setattr(mw, "_offline_buffer_dir", lambda: buf or tmp_path / "buffer")
+    monkeypatch.setattr(mw, "open_store", lambda _app, **_kw: (mw.Mode.SUPABASE, store))
     config = tmp_path / "config.ini"
     config.write_text("[Network]\n", encoding="utf-8")
+    window = SimpleNamespace()
+    window._sync_offline_outbox = lambda s: mw.MainWindow._sync_offline_outbox(window, s)
+    pm = mw.MainWindow._open_profile_manager(window, str(config))
+    return window, pm
 
-    pm = mw.MainWindow._open_profile_manager(None, str(config))
 
-    assert seen["fallback_root"] == ""
-    assert pm.store is store
+def test_a_pc_with_no_file_share_still_opens_the_database(monkeypatch, tmp_path):
+    store = FileStore(tmp_path / "server")  # stands in for the SupabaseStore open_store returns
+
+    _window, pm = _startup(monkeypatch, tmp_path, store)
+
+    assert pm.store.inner is store
+
+
+def test_supabase_mode_wraps_the_store_once(monkeypatch, tmp_path):
+    store = FileStore(tmp_path / "server")
+
+    window, pm = _startup(monkeypatch, tmp_path, store)
+
+    assert isinstance(pm.store, BufferedStore)
+    assert pm.store.inner is store  # one wrapper, not one per list
+    assert window._run_store is pm.store
+
+
+def test_pending_outbox_flushed_before_start(monkeypatch, tmp_path):
+    server = FlakyStore(tmp_path / "server")
+    buf = tmp_path / "buffer"
+    offline = BufferedStore(server, buf, pc="PC1")
+    offline.begin_list(LIST, {}, [])
+    server.down = True
+    offline.write_json(STATE, {"n": 1})
+    server.down = False
+
+    _startup(monkeypatch, tmp_path, server, buf)
+
+    assert server.read_json(STATE) == {"n": 1}
+    assert BufferedStore.pending(buf) is None
+
+
+def test_pending_outbox_permanent_error_opens_waiting_screen_flag(monkeypatch, tmp_path):
+    server = FlakyStore(tmp_path / "server")
+    buf = tmp_path / "buffer"
+    offline = BufferedStore(server, buf, pc="PC1")
+    offline.begin_list(LIST, {}, [])
+    server.down = True
+    offline.write_json(STATE, {"n": 1})
+    server.down = False
+    server.broken = "denied"
+
+    window, _pm = _startup(monkeypatch, tmp_path, server, buf)
+
+    assert window._startup_sync_error == "denied"
+    assert BufferedStore.pending(buf) == LIST  # kept whole: nothing is dropped
 
 
 def test_cancelled_sign_in_quits_with_message(monkeypatch, tmp_path):

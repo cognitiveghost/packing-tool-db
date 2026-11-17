@@ -57,7 +57,7 @@ from gui.setup_payload import order_choices, quick_payload
 from gui.theme import apply_theme, current_tokens
 from gui.workers import SessionEndWorker, SessionStartWorker
 from packing_tool import APP_NAME, __version__
-from packing_tool.offline_buffer import BufferedStore
+from packing_tool.offline_buffer import BufferedStore, UnreachableStore
 from packing_tool.profile_manager import (
     NetworkError,
     ProfileManager,
@@ -86,7 +86,6 @@ from shared.session_id import derive_session_id
 from shared.stats_manager import StatsManager
 from shared.store import StoreError
 from shared.store_mode import Mode, open_store
-from shared.store_supabase import SupabaseStore
 from shared.theme import (
     theme_notifier,
     themed_tokens,
@@ -1024,6 +1023,8 @@ class MainWindow(QMainWindow):
         A Supabase store is used when the database is reachable and signed in;
         otherwise the file share, as before.
         """
+        self._run_store = None
+        self._startup_sync_error = None  # the waiting-to-sync screen (P8) reads it
         if _use_file_store():
             return ProfileManager(config_path)
         try:
@@ -1039,11 +1040,18 @@ class MainWindow(QMainWindow):
             prompt=lambda error: SignInDialog.ask(self, error),
             outbox_pending=pending is not None,
         )
+        pc = socket.gethostname()
         if mode is Mode.SUPABASE:
-            if pending and not self._sync_offline_outbox(store, socket.gethostname()):
+            # One store per run: the managers and the list all write through it.
+            self._run_store = BufferedStore(store, buffer_dir, pc=pc)
+            if pending and not self._sync_offline_outbox(self._run_store):
                 logger.warning(f"Offline progress for {pending} is still unsynced; retried when a list starts")
-            return ProfileManager(config_path, store=store)
+            self._startup_sync_error = self._run_store.sync_error
+            return ProfileManager(config_path, store=self._run_store)
         if mode is Mode.OFFLINE_BUFFER:
+            # The run's store over no backend. ProfileManager cannot be built over it (its __init__
+            # reads local_path), so P7 opens the list from list.json here; until then, as before.
+            self._run_store = BufferedStore(UnreachableStore(), buffer_dir, pc=pc)
             # Never the file share: that progress belongs to the database. Reconnect to sync it.
             raise ProfileManagerError(
                 _(
@@ -1056,22 +1064,16 @@ class MainWindow(QMainWindow):
             self._db_fallback = True  # _init_ui shows the banner that says so
         return ProfileManager(config_path)
 
-    def _sync_offline_outbox(self, store, pc: str) -> bool:
+    def _sync_offline_outbox(self, store) -> bool:
         """Push the offline outbox, whichever run or list left it. True when nothing is unsynced."""
         if _use_file_store():
             return True
         buffer_dir = _offline_buffer_dir()
         try:
-            if not isinstance(store, BufferedStore):
-                pending = BufferedStore.pending(buffer_dir)
-                if pending is None:
-                    return True
-                if not isinstance(store, SupabaseStore):
-                    return False
-                store = BufferedStore(store, buffer_dir, pc=pc)
-            res = store.flush()
-            if res.conflict_rel:
-                self._on_offline_conflict(res.conflict_rel)
+            if isinstance(store, BufferedStore):
+                res = store.flush()
+                if res.conflict_rel:
+                    self._on_offline_conflict(res.conflict_rel)
             return BufferedStore.pending(buffer_dir) is None
         except StoreError:
             logger.exception("Offline outbox could not be synced")
@@ -1086,21 +1088,18 @@ class MainWindow(QMainWindow):
             _("Another PC took this list while you were offline. Your progress is saved as {file}.", file=rel),
         )
 
-    def _wrap_store_for_list(self, work_dir: Path):
-        """Packing a list on the database: buffer its writes while the network is down."""
-        self._unwrap_store()  # a list that failed to open may have left a wrapper for another list
-        pm = self.profile_manager
-        if not isinstance(pm.store, SupabaseStore):
-            return
-        list_dir = Path(work_dir).relative_to(pm.store.local_path("")).as_posix()
-        wrapped = BufferedStore(pm.store, _offline_buffer_dir(), pc=self.lock_manager.hostname)
-        wrapped.begin_list(list_dir, {}, [])  # P6 binds the run's list with its snapshot
-        pm.store = wrapped
+    @property
+    def buffered_store(self) -> BufferedStore | None:
+        """This run's store in database mode; None in file mode."""
+        return self._run_store
 
-    def _unwrap_store(self):
-        pm = self.profile_manager
-        if isinstance(pm.store, BufferedStore):
-            pm.store = pm.store.inner
+    def _wrap_store_for_list(self, work_dir: Path):
+        """Packing a list on the database: its writes buffer while the network is down."""
+        store = self.buffered_store
+        if store is None:
+            return
+        list_dir = Path(work_dir).relative_to(store.local_path("")).as_posix()
+        store.begin_list(list_dir, {}, [])  # the real meta and snapshot come next
 
     def _renew_lock(self, work_dir: Path) -> bool:
         """Renew the session lock. True when another PC has taken it (spec B3)."""
@@ -1843,7 +1842,6 @@ class MainWindow(QMainWindow):
         if self.logic:
             self.logic.end_session_cleanup()
             self.logic = None
-        self._unwrap_store()
 
         # Clear Shopify session variables
         if hasattr(self, "current_work_dir"):
@@ -2372,7 +2370,7 @@ class MainWindow(QMainWindow):
         (the "start packing" case); otherwise the existing work_dir is reused (resume).
         take_over is the stale lock the packer agreed to take over, or None.
         """
-        if not self._sync_offline_outbox(self.profile_manager.store, self.lock_manager.hostname):
+        if not self._sync_offline_outbox(self.profile_manager.store):
             self._toast(
                 _("This PC has offline progress that is not synced yet. Reconnect before starting another list."),
                 role="error",
