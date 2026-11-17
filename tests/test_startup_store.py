@@ -28,6 +28,7 @@ def _startup(monkeypatch, tmp_path, store, buf=None):
     config.write_text("[Network]\n", encoding="utf-8")
     window = SimpleNamespace()
     window._sync_offline_outbox = lambda s: mw.MainWindow._sync_offline_outbox(window, s)
+    window._store_flipped = lambda online: None  # the window's on_change, when a flush flips the store
     pm = mw.MainWindow._open_profile_manager(window, str(config))
     return window, pm
 
