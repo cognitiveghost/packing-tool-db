@@ -1,11 +1,14 @@
 """BufferedStore: durable outbox, order, conflict copies (plan Task 11, review focus #1)."""
+import json
 import threading
 import time
 
 import pytest
+from offline_fakes import FlakyStore
 
 from packing_tool.offline_buffer import BufferedStore
-from shared.store import FileStore, StoreError
+from packing_tool.worker_manager import REGISTRY
+from shared.store import Delta, StoreError, StoreUnreachable
 
 LIST = "Sessions/CLIENT_M/2026-01-01_1/packing/DHL"
 STATE = f"{LIST}/packing_state.json"
@@ -13,37 +16,9 @@ INFO = "Sessions/CLIENT_M/2026-01-01_1/session_info.json"
 STATS = "Stats/global_stats.json"
 
 
-class FlakyStore(FileStore):
-    """A FileStore whose network can be cut; the lock can be taken by another PC."""
-
-    def __init__(self, root):
-        super().__init__(root)
-        self.down = False
-        self.lock_ours = True
-
-    def _check(self):
-        if self.down:
-            raise StoreError("network")
-
-    def read_json(self, rel):
-        self._check()
-        return super().read_json(rel)
-
-    def write_json(self, rel, data):
-        self._check()
-        super().write_json(rel, data)
-
-    def write_bytes(self, rel, data):
-        self._check()
-        super().write_bytes(rel, data)
-
-    def exists(self, rel):
-        self._check()
-        return super().exists(rel)
-
-    def heartbeat_list_lock(self, list_dir, pc):
-        self._check()
-        return self.lock_ours
+def outbox_ops(tmp_path):
+    path = tmp_path / "buf" / "outbox.jsonl"
+    return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
 
 @pytest.fixture
@@ -52,7 +27,11 @@ def inner(tmp_path):
 
 
 def make(inner, tmp_path):
-    return BufferedStore(inner, tmp_path / "buf", list_dir=LIST, pc="PC1")
+    """A run's store bound to LIST. A restart rebinds from list.json, so it is not bound twice."""
+    b = BufferedStore(inner, tmp_path / "buf", pc="PC1")
+    if b.bound_list() is None:
+        b.begin_list(LIST, {}, [])
+    return b
 
 
 def test_online_writes_go_straight_through(inner, tmp_path):
@@ -60,6 +39,24 @@ def test_online_writes_go_straight_through(inner, tmp_path):
     b.write_json(STATE, {"n": 1})
     assert inner.read_json(STATE) == {"n": 1}
     assert BufferedStore.pending(tmp_path / "buf") is None
+
+
+def test_permanent_error_is_raised_not_buffered(inner, tmp_path):
+    b = make(inner, tmp_path)
+    inner.broken = "denied"
+    with pytest.raises(StoreError) as e:
+        b.write_json(STATE, {"n": 1})
+    assert not isinstance(e.value, StoreUnreachable)
+    assert not (tmp_path / "buf" / "outbox.jsonl").exists()
+    assert b.online is True
+
+
+def test_unreachable_is_buffered(inner, tmp_path):
+    b = make(inner, tmp_path)
+    inner.down = True
+    b.write_json(STATE, {"n": 1})
+    assert len((tmp_path / "buf" / "outbox.jsonl").read_text().splitlines()) == 1
+    assert b.online is False
 
 
 def test_offline_write_lands_after_flush(inner, tmp_path):
@@ -160,19 +157,18 @@ def test_offline_write_outside_list_refused(inner, tmp_path):
     assert BufferedStore.pending(tmp_path / "buf") is None
 
 
-def test_finish_list_offline_queues_summary_and_stats(inner, tmp_path):
+def test_finish_list_offline_queues_summary_stats_and_progress(inner, tmp_path):
     b = make(inner, tmp_path)
     inner.down = True
     b.write_json(f"{LIST}/session_summary.json", {"done": True})
-    b.write_json(INFO, {"status": "packed"})
-    b.write_json(STATS, {"orders": 1})
+    b.update_json(INFO, Delta("session_info.packing_progress", {"status": "completed"}))
+    b.update_json(STATS, Delta("stats.record_packing", {"orders_count": 1}))
     b.write_bytes(f"{LIST}/report.bin", b"\x00\x01")
-    inner.down = False
-    assert b.flush().pushed == 4
-    assert inner.read_json(f"{LIST}/session_summary.json") == {"done": True}
-    assert inner.read_json(INFO) == {"status": "packed"}
-    assert inner.read_json(STATS) == {"orders": 1}
-    assert inner.read_bytes(f"{LIST}/report.bin") == b"\x00\x01"
+    b.release_list_lock(LIST, "PC1")
+    assert [o["op"] for o in outbox_ops(tmp_path)] == [
+        "write_json", "delta", "delta", "write_bytes", "release_lock",
+    ]
+    assert b.finished()
 
 
 def test_list_dir_is_still_the_store_method(inner, tmp_path):
@@ -186,7 +182,7 @@ def test_packing_overview_forwards_and_marks_lost_on_error(inner, tmp_path, monk
     assert b.packing_overview("M") == [{"list_name": "DHL", "c": "M"}]
 
     def down(client_id):
-        raise StoreError("network")
+        raise StoreUnreachable("network")
 
     monkeypatch.setattr(inner, "packing_overview", down)
     with pytest.raises(StoreError, match="network"):
@@ -252,9 +248,65 @@ def test_write_during_flush_is_not_lost(inner, tmp_path):
     assert BufferedStore.pending(tmp_path / "buf") is None
 
 
-def test_second_list_refused_while_outbox_pending(inner, tmp_path):
+@pytest.mark.parametrize("rel", [STATS, REGISTRY, INFO])
+def test_offline_delta_on_shared_doc_is_queued(inner, tmp_path, rel):
     b = make(inner, tmp_path)
     inner.down = True
-    b.write_json(STATE, {"n": 1})
-    with pytest.raises(StoreError, match="not synced"):
-        BufferedStore(inner, tmp_path / "buf", list_dir=LIST.replace("DHL", "UPS"), pc="PC1")
+    assert b.update_json(rel, Delta("test.noop", {"n": 1})) is None
+    [op] = outbox_ops(tmp_path)
+    assert op["op"] == "delta"
+    assert (op["rel"], op["list_dir"], op["kind"], op["args"]) == (rel, LIST, "test.noop", {"n": 1})
+    assert len(op["op_id"]) == 32
+    assert not (tmp_path / "buf" / "state" / rel).exists()
+
+
+@pytest.mark.parametrize("rel", [STATS, REGISTRY, INFO])
+def test_offline_plain_write_to_shared_doc_raises_unreachable(inner, tmp_path, rel):
+    b = make(inner, tmp_path)
+    inner.down = True
+    with pytest.raises(StoreUnreachable):
+        b.write_json(rel, {})
+    with pytest.raises(StoreUnreachable):
+        b.update_json(rel, lambda cur: cur)
+    assert outbox_ops(tmp_path) == []
+
+
+def test_offline_write_outside_allow_list_raises_unreachable(inner, tmp_path):
+    b = make(inner, tmp_path)
+    inner.down = True
+    with pytest.raises(StoreUnreachable):
+        b.write_json("Clients/CLIENT_M/client_config.json", {})
+    with pytest.raises(StoreUnreachable):
+        b.update_json("Clients/CLIENT_M/client_config.json", Delta("test.noop", {}))
+    assert outbox_ops(tmp_path) == []
+
+
+def test_delta_queued_when_inner_drops_mid_call(inner, tmp_path, monkeypatch):
+    b = make(inner, tmp_path)
+    inner.write_json(STATS, {"orders": 0})
+
+    def drop(rel, fn):
+        raise StoreUnreachable("network")
+
+    monkeypatch.setattr(inner, "update_json", drop)
+    assert b.update_json(STATS, Delta("test.noop", {"n": 1})) is None
+    assert [o["op"] for o in outbox_ops(tmp_path)] == ["delta"]
+    assert b.online is False
+    assert inner.read_json(STATS) == {"orders": 0}
+
+
+def test_offline_release_of_bound_list_is_queued(inner, tmp_path):
+    b = make(inner, tmp_path)
+    assert not b.finished()
+    inner.down = True
+    b.release_list_lock(LIST, "PC1")
+    assert outbox_ops(tmp_path) == [{"op": "release_lock", "list_dir": LIST}]
+    assert b.finished()
+
+
+def test_offline_release_of_other_list_raises_unreachable(inner, tmp_path):
+    b = make(inner, tmp_path)
+    inner.down = True
+    with pytest.raises(StoreUnreachable):
+        b.release_list_lock("Sessions/CLIENT_M/2026-01-01_1/packing/UPS", "PC1")
+    assert outbox_ops(tmp_path) == []

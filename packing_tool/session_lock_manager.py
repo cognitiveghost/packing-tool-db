@@ -15,7 +15,13 @@ from datetime import datetime
 from pathlib import Path
 
 from shared.metadata_utils import parse_timestamp
-from shared.store import LOCK_FILENAME, STALE_SECONDS, StoreError, StoreNotFound
+from shared.store import (
+    LOCK_FILENAME,
+    STALE_SECONDS,
+    FileStore,
+    StoreError,
+    StoreNotFound,
+)
 
 LOCK_READ_ATTEMPTS = 3
 LOCK_READ_RETRY_SECONDS = 0.2
@@ -213,6 +219,13 @@ class SessionLockManager:
             True if lock was released, False otherwise
         """
         try:
+            if not isinstance(self.store, FileStore):
+                # The database has no lock file to read: its release checks the holder
+                # itself, and offline BufferedStore queues it (what "finished" means).
+                self.store.release_list_lock(self._dir_rel(session_dir), self.hostname)
+                self.logger.info("Session lock released", extra={"session_dir": str(session_dir)})
+                return True
+
             data = self._read(session_dir)
             if data is None:
                 self.logger.debug(f"No lock file to release: {session_dir / LOCK_FILENAME}")

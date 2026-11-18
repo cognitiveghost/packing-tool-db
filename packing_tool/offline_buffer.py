@@ -10,27 +10,52 @@ import json
 import os
 import shutil
 import threading
+import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from packing_tool.worker_manager import REGISTRY
 from shared.stats_manager import STATS_REL
 from shared.store import (
     SESSION_INFO,
+    Delta,
     FileStore,
     Store,
-    StoreConflict,
     StoreError,
     StoreNotFound,
+    StoreUnreachable,
 )
 
 OUTBOX = "outbox.jsonl"
+LIST_META = "list.json"  # the bound list: what a restart needs to reopen it with no database
+SNAPSHOT = "snapshot"  # copies of the documents the bound list reads, served when unreachable
+
+
+def _read_meta(buffer_dir: Path) -> dict | None:
+    try:
+        return json.loads((Path(buffer_dir) / LIST_META).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except ValueError:
+        return None  # unreadable: the outbox still names its list (spec §8.3)
+
+
+def _write_meta(buffer_dir: Path, meta: dict) -> None:
+    tmp = Path(buffer_dir) / (LIST_META + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(meta, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, Path(buffer_dir) / LIST_META)
 
 
 @dataclass
 class FlushResult:
     pushed: int
     conflict_rel: str | None = None
+    error: str | None = None  # a permanent refusal: the outbox is kept whole, nothing skipped
 
 
 def _read_outbox(buffer_dir: Path) -> list[dict]:
@@ -60,36 +85,100 @@ def _drop_torn_tail(path: Path) -> None:
 
 
 class BufferedStore(Store):
-    def __init__(self, inner: Store, buffer_dir: Path, *, list_dir: str, pc: str):
+    def __init__(
+        self, inner: Store, buffer_dir: Path, *, pc: str, on_change: Callable[[bool], None] | None = None
+    ):
         self.inner = inner
         self.buffer_dir = Path(buffer_dir)
-        self.list_rel = list_dir  # not self.list_dir: that is the Store method below
         self.pc = pc
         self.derived_indexes = inner.derived_indexes
+        self._on_change = on_change
+        self.sync_error: str | None = None  # why the last flush stopped on a permanent error
         self._state = FileStore(self.buffer_dir / "state")
+        self._snapshot = FileStore(self.buffer_dir / SNAPSHOT)
         # The heartbeat thread flushes while the UI thread writes: an op appended mid-flush
         # must never be cleared unpushed.
         self._mutex = threading.RLock()
-        parts = list_dir.split("/")
-        self._allowed_exact = {STATS_REL, "/".join(parts[:3] + [SESSION_INFO])}
         self.buffer_dir.mkdir(parents=True, exist_ok=True)
         _drop_torn_tail(self.buffer_dir / OUTBOX)
         ops = self._ops()
-        if ops and ops[0]["list_dir"] != list_dir:
-            # One outbox holds one list: its ops are checked against that list's lock only.
-            raise StoreError(f"offline progress for {ops[0]['list_dir']} is not synced yet")
         # The outbox is the truth; state/ is its read cache. Rebuild it, so a kill between
         # the two writes, or a half-done clear, never serves a value the outbox lacks.
-        shutil.rmtree(self.buffer_dir / "state", ignore_errors=True)
+        # A blob exists only in state/ (the outbox names it), so carry it across the rebuild.
+        # Deleted around, never read and rewritten: a kill mid-rebuild must not lose one.
+        blobs = {op["blob_file"] for op in ops if op["op"] == "write_bytes"}
+        state_root = self.buffer_dir / "state"
+        for path in list(state_root.rglob("*")) if state_root.exists() else []:
+            if path.is_file() and path.relative_to(state_root).as_posix() not in blobs:
+                path.unlink()
         for op in ops:
-            if op["op"] != "write_bytes":
+            if op["op"] in ("write_json", "update_json_result"):
                 self._state.write_json(op["rel"], op["data"])
-        self.online = not ops  # a leftover outbox means we have not flushed yet
+        self._online = not ops  # a leftover outbox means we have not flushed yet
+        self._bind(_read_meta(self.buffer_dir))
+
+    @property
+    def online(self) -> bool:
+        return self._online
+
+    @online.setter
+    def online(self, value: bool) -> None:
+        value = bool(value)
+        if value != self._online:
+            self._online = value
+            if self._on_change:
+                self._on_change(value)
+
+    def _bind(self, meta: dict | None) -> None:
+        self._meta = meta
+        self._list_dir = meta["list_dir"] if meta else None
 
     @staticmethod
     def pending(buffer_dir: Path) -> str | None:
         ops = _read_outbox(buffer_dir)
         return ops[0]["list_dir"] if ops else None
+
+    @staticmethod
+    def pending_meta(buffer_dir: Path) -> dict | None:
+        return _read_meta(buffer_dir) if _read_outbox(buffer_dir) else None
+
+    def bound_list(self) -> dict | None:
+        return dict(self._meta) if self._meta else None
+
+    def begin_list(self, list_dir: str, meta: dict, snapshot_rels: list[str]) -> None:
+        """Bind the run to the open list, keeping what a restart offline reads of it."""
+        with self._mutex:
+            ops = self._ops()
+            if ops and ops[0]["list_dir"] != list_dir:
+                # One outbox holds one list: its ops are checked against that list's lock only.
+                raise StoreError(f"offline progress for {ops[0]['list_dir']} is not synced yet")
+            # Read everything before writing anything: a failed read leaves the old snapshot intact.
+            docs = {}
+            for rel in snapshot_rels:
+                try:
+                    docs[rel] = self.inner.read_json(rel)
+                except StoreNotFound:
+                    continue
+            for rel, data in docs.items():
+                self._snapshot.write_json(rel, data)
+            entry = {**meta, "list_dir": list_dir}
+            _write_meta(self.buffer_dir, entry)
+            self._bind(entry)
+
+    def end_list(self) -> None:
+        """Unbind once the outbox is empty. Pending ops keep the list bound: they still need it."""
+        with self._mutex:
+            if self._ops():
+                return
+            (self.buffer_dir / LIST_META).unlink(missing_ok=True)
+            shutil.rmtree(self.buffer_dir / SNAPSHOT, ignore_errors=True)
+            self._bind(None)
+
+    def attach(self, inner: Store) -> None:
+        """Swap in the real backend once it is connected (UnreachableStore before that)."""
+        with self._mutex:
+            self.inner = inner
+            self.derived_indexes = inner.derived_indexes
 
     # --- outbox -----------------------------------------------------------
     def _ops(self) -> list[dict]:
@@ -106,13 +195,32 @@ class BufferedStore(Store):
                 f.truncate(start)  # no half line for the next append to fuse with
                 raise
 
-    def _check_allowed(self, rel: str) -> None:
-        if rel not in self._allowed_exact and not rel.startswith(self.list_rel + "/"):
-            raise StoreError("offline")
+    def _check_allowed(self, rel: str, *, delta: bool = False) -> None:
+        """Offline: the bound list's folder (whole documents), or a Delta on a shared doc only."""
+        lst = self._list_dir
+        if lst is None:
+            raise StoreUnreachable("offline")
+        session_info = "/".join(lst.split("/")[:3] + [SESSION_INFO])
+        if rel in (STATS_REL, REGISTRY, session_info):
+            if not delta:
+                raise StoreUnreachable("offline")  # a whole-document replay would overwrite other PCs
+            return
+        if not rel.startswith(lst + "/"):
+            raise StoreUnreachable("offline")
+
+    def _queue_delta(self, rel: str, d: Delta) -> None:
+        self._check_allowed(rel, delta=True)
+        entry = {
+            "op": "delta", "rel": rel, "list_dir": self._list_dir,
+            "kind": d.kind, "args": d.args, "op_id": d.op_id,
+        }
+        with self._mutex:
+            self._append(entry)  # no state/ copy: nothing reads shared docs offline
+            self.online = False
 
     def _buffer(self, op: str, rel: str, data=None, blob: bytes | None = None) -> None:
         self._check_allowed(rel)
-        entry = {"op": op, "rel": rel, "list_dir": self.list_rel}
+        entry = {"op": op, "rel": rel, "list_dir": self._list_dir}
         with self._mutex:
             if blob is not None:
                 self._state.write_bytes(rel, blob)  # the blob exists before an op names it
@@ -125,8 +233,8 @@ class BufferedStore(Store):
             self.online = False  # flushed on the next heartbeat, even if a flush just ended
 
     def _lost(self, e: StoreError) -> bool:
-        """A network-ish failure: flips to offline. Not-found and conflicts are real answers."""
-        if isinstance(e, (StoreNotFound, StoreConflict)):
+        """An unreachable backend flips to offline. Any other error is a real answer."""
+        if not isinstance(e, StoreUnreachable):
             return False
         self.online = False
         return True
@@ -135,28 +243,30 @@ class BufferedStore(Store):
     def _buffered(self, rel) -> bool:
         return not self.online and self._state.exists(rel)
 
+    def _inner_or_snapshot(self, rel, read, fallback):
+        """Inner first. Unreachable: go offline, and serve the snapshot copy of rel when there is one."""
+        try:
+            return read()
+        except StoreError as e:
+            self._lost(e)
+            if isinstance(e, StoreUnreachable) and self._snapshot.exists(rel):
+                return fallback()
+            raise
+
     def read_json(self, rel):
         if self._buffered(rel):
             return self._state.read_json(rel)
-        try:
-            return self.inner.read_json(rel)
-        except StoreError as e:
-            self._lost(e)
-            raise
+        return self._inner_or_snapshot(rel, lambda: self.inner.read_json(rel), lambda: self._snapshot.read_json(rel))
 
     def read_bytes(self, rel):
         if self._buffered(rel):
             return self._state.read_bytes(rel)
-        try:
-            return self.inner.read_bytes(rel)
-        except StoreError as e:
-            self._lost(e)
-            raise
+        return self._inner_or_snapshot(rel, lambda: self.inner.read_bytes(rel), lambda: self._snapshot.read_bytes(rel))
 
     def exists(self, rel):
         if self._buffered(rel):
             return True
-        return self._inner(self.inner.exists, rel)
+        return self._inner_or_snapshot(rel, lambda: self.inner.exists(rel), lambda: True)
 
     # --- writes: inner when online and nothing queued, else the outbox -----------
     # Under the mutex, so a write never lands directly on inner while older ops still wait.
@@ -171,6 +281,10 @@ class BufferedStore(Store):
             self._buffer("write_json", rel, data)
 
     def update_json(self, rel, fn):
+        if isinstance(fn, Delta) and fn.op_id is None:
+            # An id before the first try: a commit whose answer was lost is queued
+            # with the same id, so the flush skips it instead of counting it twice.
+            fn.op_id = uuid.uuid4().hex
         with self._mutex:
             if self.online:
                 try:
@@ -178,16 +292,18 @@ class BufferedStore(Store):
                 except StoreError as e:
                     if not self._lost(e):
                         raise
+            # Queued once, never applied locally too: the replay on flush applies it.
+            if isinstance(fn, Delta):
+                self._queue_delta(rel, fn)
+                return None
+            self._check_allowed(rel)  # a closure is replayed as a whole document: no shared docs
             try:
                 current = self.read_json(rel)
             except StoreNotFound:
                 current = None
             except StoreError:
-                raise StoreError("offline") from None  # never fn(None) over a state we could not read
+                raise StoreUnreachable("offline") from None  # never fn(None) over a state we could not read
             result = fn(current)
-            # ponytail: replayed as a whole-document write, so on a shared doc (stats,
-            # session_info) it is last-writer-wins over other PCs' edits made meanwhile. Offline
-            # it only runs once the doc is buffered; queue deltas if that ever becomes common.
             self._buffer("update_json_result", rel, result)
             return result
 
@@ -234,7 +350,22 @@ class BufferedStore(Store):
         return self._inner(self.inner.heartbeat_list_lock, list_dir, pc)
 
     def release_list_lock(self, list_dir, pc):
-        return self._inner(self.inner.release_list_lock, list_dir, pc)
+        with self._mutex:
+            if self.online:
+                try:
+                    return self.inner.release_list_lock(list_dir, pc)
+                except StoreError as e:
+                    if not self._lost(e):
+                        raise
+            if list_dir != self._list_dir:
+                raise StoreUnreachable("offline")
+            self._append({"op": "release_lock", "list_dir": list_dir})  # replayed on flush
+            self.online = False
+
+    def finished(self) -> bool:
+        """The list is finished: its release is queued, waiting for the flush."""
+        with self._mutex:
+            return any(op["op"] == "release_lock" for op in self._ops())
 
     def lock_info(self, list_dir):
         return self._inner(self.inner.lock_info, list_dir)
@@ -260,55 +391,104 @@ class BufferedStore(Store):
         with self._mutex:  # no append between reading the outbox and clearing it
             ops = self._ops()
             if not ops:
+                self.sync_error = None
                 self.online = True
                 return FlushResult(0)
+            list_dir = ops[0]["list_dir"]  # one outbox holds one list
             try:
-                ours = self.inner.heartbeat_list_lock(self.list_rel, self.pc)
-            except StoreError:
-                self.online = False
-                return FlushResult(0)
+                ours = self.inner.heartbeat_list_lock(list_dir, self.pc)
+            except StoreError as e:
+                return self._failed(0, e)
             if not ours:
-                return self._write_conflict(ops)
-            pushed = 0
-            for op in ops:
+                return self._write_conflict(ops, list_dir)
+            # The release is replayed last, so every write under the list lands while we hold it.
+            ordered = [o for o in ops if o["op"] != "release_lock"] + [o for o in ops if o["op"] == "release_lock"]
+            for pushed, op in enumerate(ordered):
                 try:
-                    if op["op"] == "write_bytes":
-                        self.inner.write_bytes(op["rel"], self._state.read_bytes(op["blob_file"]))
-                    else:
-                        self.inner.write_json(op["rel"], op["data"])
-                except StoreError:
-                    self.online = False
-                    self._rewrite_outbox(ops[pushed:])
-                    return FlushResult(pushed)
-                pushed += 1
+                    self._replay(op)
+                except Exception as e:  # any stop keeps the outbox whole: nothing is skipped or dropped
+                    return self._failed(pushed, e)
+            finished = any(o["op"] == "release_lock" for o in ops)
             self._clear()
+            if finished:
+                self.end_list()  # the list is done: unbind it and drop its snapshot
+            self.sync_error = None
             self.online = True
+            return FlushResult(len(ordered))
+
+    def _replay(self, op: dict) -> None:
+        kind = op["op"]
+        if kind == "write_bytes":
+            self.inner.write_bytes(op["rel"], self._state.read_bytes(op["blob_file"]))
+        elif kind == "delta":
+            # The op_id is stored in the doc it guards: a rerun after a kill skips what already landed.
+            self.inner.update_json(op["rel"], Delta.from_op(op))
+        elif kind == "release_lock":
+            self.inner.release_list_lock(op["list_dir"], self.pc)
+        else:
+            self.inner.write_json(op["rel"], op["data"])
+
+    def _failed(self, pushed: int, e: Exception) -> FlushResult:
+        """Unreachable: stay offline, retry later. Any other error: say why, and keep the outbox."""
+        self.online = False
+        if isinstance(e, StoreUnreachable):
             return FlushResult(pushed)
+        self.sync_error = str(e) or type(e).__name__
+        return FlushResult(pushed, error=self.sync_error)
 
-    def _rewrite_outbox(self, ops: list[dict]) -> None:
-        tmp = self.buffer_dir / (OUTBOX + ".tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.writelines(json.dumps(o) + "\n" for o in ops)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, self.buffer_dir / OUTBOX)
-
-    def _write_conflict(self, ops: list[dict]) -> FlushResult:
+    def _write_conflict(self, ops: list[dict], list_dir: str) -> FlushResult:
         """Another PC took the list: park everything we buffered beside its state, overwrite nothing."""
         state: dict = {}
         blobs: dict = {}
+        deltas: list[dict] = []
         for op in ops:  # later ops win, same as a replay
             if op["op"] == "write_bytes":
                 blobs[op["rel"]] = base64.b64encode(self._state.read_bytes(op["blob_file"])).decode("ascii")
-            else:
+            elif op["op"] == "delta":
+                deltas.append({k: op[k] for k in ("rel", "kind", "args", "op_id")})  # parked, not applied
+            elif op["op"] in ("write_json", "update_json_result"):
                 state[op["rel"]] = op["data"]
         stamp = datetime.now().strftime("%Y%m%d%H%M%S")
-        rel = f"{self.list_rel}/packing_state_conflict_{self.pc}_{stamp}.json"
+        rel = f"{list_dir}/packing_state_conflict_{self.pc}_{stamp}.json"
         try:
-            self.inner.write_json(rel, {"pc": self.pc, "state": state, "blobs_b64": blobs})
-        except StoreError:
-            self.online = False
-            return FlushResult(0)  # outbox kept: nothing is dropped until the copy is safe
+            self.inner.write_json(rel, {"pc": self.pc, "state": state, "blobs_b64": blobs, "deltas": deltas})
+        except StoreError as e:
+            return self._failed(0, e)  # outbox kept: nothing is dropped until the copy is safe
         self._clear()
+        self.sync_error = None
         self.online = True
         return FlushResult(0, rel)
+
+
+_STORE_METHODS = [n for n, v in vars(Store).items() if callable(v) and not n.startswith("_")]
+
+
+def _unreachable(name: str):
+    def refuse(self, *args, **kwargs):
+        raise StoreUnreachable("database not connected")
+
+    refuse.__name__ = name
+    return refuse
+
+
+class UnreachableStore(Store):
+    """The Store before a database sign-in: every call is a network failure, so writes queue.
+
+    Its local tree is the database cache when one is given (as SupabaseStore's), so a
+    ProfileManager and the packing list can be built over it while offline.
+    """
+
+    derived_indexes = True
+
+    def __init__(self, cache_dir: Path | None = None):
+        self._cache = None if cache_dir is None else Path(cache_dir)
+
+    def local_path(self, rel: str = ""):
+        if self._cache is None:
+            raise StoreUnreachable("database not connected")
+        return self._cache / rel
+
+
+for _name in _STORE_METHODS:
+    if _name != "local_path":
+        setattr(UnreachableStore, _name, _unreachable(_name))

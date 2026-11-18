@@ -12,7 +12,7 @@ from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton, QVBoxLay
 
 from shared.i18n import _
 from shared.icons import icon
-from shared.theme import font_css, on_theme_changed
+from shared.theme import current_tokens, font_css, on_theme_changed
 
 
 class ConnectionBanner(QFrame):
@@ -49,13 +49,28 @@ class ConnectionBanner(QFrame):
 
         self._path = ""
         self._since = ""
+        self._notice: tuple[str, str] | None = None
+        self._tone = "danger"
         on_theme_changed(self, self._apply_theme)
 
     def set_outage(self, server_path: str, since: str) -> None:
         self._path, self._since = server_path, since
         self._write_message()
 
+    def set_notice(self, title: str, message: str, tone: str = "danger") -> None:
+        """A fixed title and message for a state with no Retry: the fallback to the file share
+        (danger), or the offline banner (warning)."""
+        self._notice = (title, message)
+        self._tone = tone
+        self.retry_button.hide()
+        self._write_message()
+        self._apply_theme(current_tokens())
+
     def _write_message(self) -> None:
+        if self._notice:
+            self.title_label.setText(self._notice[0])
+            self.message_label.setText(escape(self._notice[1]))
+            return
         mono = self._mono
         self.message_label.setText(
             _(
@@ -70,12 +85,16 @@ class ConnectionBanner(QFrame):
 
     def _apply_theme(self, t) -> None:
         self._mono = t.font_family_mono
+        if self._tone == "warning":
+            bg, edge, ink = t.status_warning_bg, t.status_warning, t.status_warning
+        else:
+            bg, edge, ink = t.status_danger_bg, t.status_danger_border, t.status_danger
         self.setStyleSheet(
-            f"#ConnectionBanner {{ background-color: {t.status_danger_bg};"
-            f" border: 1px solid {t.status_danger_border}; border-radius: 12px; }}"
+            f"#ConnectionBanner {{ background-color: {bg};"
+            f" border: 1px solid {edge}; border-radius: 12px; }}"
             f"#ConnectionBanner QLabel {{ background: transparent; }}"
-            f"#BannerTitle {{ color: {t.status_danger}; {font_css('body', bold=True)} }}"
+            f"#BannerTitle {{ color: {ink}; {font_css('body', bold=True)} }}"
             f"#BannerMessage {{ color: {t.text}; {font_css('body')} }}"
         )
-        self.glyph.setPixmap(icon("circle-alert", color=t.status_danger).pixmap(24, 24))
+        self.glyph.setPixmap(icon("circle-alert", color=ink).pixmap(24, 24))
         self._write_message()

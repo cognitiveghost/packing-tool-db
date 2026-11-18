@@ -55,9 +55,11 @@ from gui.sessions_payload import session_key
 from gui.setup_pages import SetupPages
 from gui.setup_payload import order_choices, quick_payload
 from gui.theme import apply_theme, current_tokens
+from gui.waiting_sync_page import WaitingSyncPage
 from gui.workers import SessionEndWorker, SessionStartWorker
 from packing_tool import APP_NAME, __version__
-from packing_tool.offline_buffer import BufferedStore
+from packing_tool.offline_buffer import BufferedStore, UnreachableStore
+from packing_tool.packer_logic import STATE_FILE_NAME
 from packing_tool.profile_manager import (
     NetworkError,
     ProfileManager,
@@ -69,9 +71,11 @@ from packing_tool.session_lock_manager import SessionLockManager
 from packing_tool.session_manager import SessionManager
 from packing_tool.session_registry_manager import SessionRegistryManager
 from packing_tool.worker_manager import WorkerManager
+from shared import db_auth
 from shared.components.language_segment import switch_language
 from shared.components.sign_in_dialog import SignInDialog
 from shared.components.toast import toast
+from shared.db_auth import SignInCancelled
 from shared.fonts import load_bundled_fonts
 from shared.guide.help import open_guide
 from shared.i18n import N_, _, _n
@@ -83,9 +87,8 @@ from shared.server_connection import (
 )
 from shared.session_id import derive_session_id
 from shared.stats_manager import StatsManager
-from shared.store import StoreError
+from shared.store import SESSION_INFO, StoreError, StoreUnreachable
 from shared.store_mode import Mode, open_store
-from shared.store_supabase import SupabaseStore
 from shared.theme import (
     theme_notifier,
     themed_tokens,
@@ -162,6 +165,16 @@ def _offline_buffer_dir() -> Path:
     return Path(base) / "PackingTool-DB" / "buffer"
 
 
+def _db_cache_dir() -> Path:
+    """The local tree of the database store: the Supabase cache, and the offline run's too."""
+    return Path(os.path.expanduser("~")) / ".packers_assistant" / "db_cache"
+
+
+def _store_rel(store, path) -> str:
+    """The store path (POSIX, from the server root) of a path inside the store's local tree."""
+    return Path(path).relative_to(store.local_path("")).as_posix()
+
+
 def _use_file_store() -> bool:
     """The file share only (no Supabase sign-in): FULFILLMENT_STORE_MODE=file, or a test run."""
     return os.environ.get("FULFILLMENT_STORE_MODE", "").strip().lower() == "file" or _under_pytest()
@@ -187,6 +200,10 @@ class MainWindow(QMainWindow):
     # A background heartbeat found another PC holding the lock (its work_dir)
     _heartbeat_lost = Signal(str)
     _offline_conflict = Signal(str)  # conflict-copy path, from the heartbeat thread
+    # From the sync thread (and the store's flips), queued to the UI thread (spec §8.5).
+    _offline_changed = Signal(bool)  # the buffered store came online (True) or went offline
+    _sync_done = Signal(object)  # FlushResult of a sync pass
+    _sign_in_needed = Signal()  # a saved sign-in was refused while offline: ask on the UI thread
     # Emitted from the connection-check thread; queued to the UI thread.
     _connection_checked = Signal(bool)
 
@@ -218,6 +235,7 @@ class MainWindow(QMainWindow):
 
         # Initialize ProfileManager, offering a path-recovery prompt on
         # NetworkError instead of exiting immediately.
+        self._db_fallback = False
         while True:
             try:
                 self.profile_manager = self._open_profile_manager(config_path)
@@ -229,6 +247,14 @@ class MainWindow(QMainWindow):
                 if prompt_for_recovery_path(self, str(e), "PackingTool-DB"):
                     continue
                 sys.exit(1)
+            except SignInCancelled:
+                # Not an outage: a window without a store is no use. Say why, and quit.
+                QMessageBox.information(
+                    self,
+                    _("Not signed in"),
+                    _("The app needs a sign-in to start. Open it again to sign in."),
+                )
+                sys.exit(0)
             except Exception as e:
                 logger.exception("Unexpected error initializing ProfileManager")
                 QMessageBox.critical(
@@ -248,6 +274,12 @@ class MainWindow(QMainWindow):
         self._starting = False  # see start_shopify_packing_session()
         self._heartbeat_lost.connect(self._on_heartbeat_lost)
         self._offline_conflict.connect(self._on_offline_conflict)
+        self._offline_changed.connect(self._on_offline_changed)
+        self._sync_done.connect(self._on_sync_done)
+        self._sign_in_needed.connect(self._on_sign_in_needed)
+        self._sync_busy = False  # one sync pass at a time (the _heartbeat_busy pattern)
+        self._sync_thread = None
+        self._sign_in_declined = False  # the user cancelled a sign-in this run: no more prompts
         # ok / checking / down (spec 2026-10-08 section 6.5). Checked on Retry
         # and after a failed session action, never on a timer (owner decision).
         self._connection_state = "ok"
@@ -312,8 +344,12 @@ class MainWindow(QMainWindow):
 
         # Load available clients and restore last selected
         self.load_available_clients()
+        resumed = self._start_from_outbox()
+        self._refresh_offline_banner()
+        self._update_sync_timer()
 
-        if not self._is_test_mode:
+        # A list resumed from the buffer, or the waiting screen, is what the packer sees first.
+        if not self._is_test_mode and not resumed:
             # The first thing a packer sees: who is packing (spec 2026-10-09,
             # section 4.4). The shell is built and waits underneath.
             self._open_setup(lambda: self.setup_pages.show_workers(startup=True))
@@ -439,10 +475,19 @@ class MainWindow(QMainWindow):
         # on a container, so hiding it leaves no gap above the page.
         self.connection_banner = ConnectionBanner()
         self.connection_banner.retryRequested.connect(self.check_connection)
+        # The database failed at startup and this run works from the file share. Persistent
+        # until restart: the run cannot switch stores (spec section 7).
+        self.file_fallback_banner = ConnectionBanner()
+        self.file_fallback_banner.set_notice(
+            _("Database unreachable: working from file server"),
+            _("Changes save to the file server. Restart the app to try the database again."),
+        )
+        self.file_fallback_banner.setVisible(self._db_fallback)
         self._banner_row = QWidget()
         banner_layout = QVBoxLayout(self._banner_row)
         banner_layout.setContentsMargins(24, 20, 24, 0)
         banner_layout.addWidget(self.connection_banner)
+        banner_layout.addWidget(self.file_fallback_banner)
         main_layout.addWidget(self._banner_row)
 
         main_layout.addWidget(self.session_tabs, 1)
@@ -488,7 +533,30 @@ class MainWindow(QMainWindow):
         self.stacked_widget.addWidget(self.session_widget)
         self.stacked_widget.addWidget(self.packer_mode_widget)
         self.stacked_widget.addWidget(self.setup_pages)
-        self.setCentralWidget(self.stacked_widget)
+        self.waiting_page = WaitingSyncPage()
+        self.waiting_page.syncRequested.connect(self._sync_now)
+        self.stacked_widget.addWidget(self.waiting_page)
+        # Above every page, the packing screen included: the packer always sees the outage (spec §8.4).
+        self.offline_banner = ConnectionBanner()
+        self.offline_banner.set_notice(
+            _("Offline"),
+            _("Progress is saved on this PC and syncs when the database is back."),
+            tone="warning",
+        )
+        self._offline_row = QWidget()
+        offline_layout = QVBoxLayout(self._offline_row)
+        offline_layout.setContentsMargins(24, 12, 24, 0)
+        offline_layout.addWidget(self.offline_banner)
+        central = QWidget()
+        central_layout = QVBoxLayout(central)
+        central_layout.setContentsMargins(0, 0, 0, 0)
+        central_layout.setSpacing(0)
+        central_layout.addWidget(self._offline_row)
+        central_layout.addWidget(self.stacked_widget, 1)
+        self.setCentralWidget(central)
+        self._sync_timer = QTimer(self)  # the sync driver, 60 s (spec §8.5)
+        self._sync_timer.setInterval(60000)
+        self._sync_timer.timeout.connect(self._sync_tick)
 
         self._init_overflow()
         self.update_flow = UpdateFlow(
@@ -792,6 +860,10 @@ class MainWindow(QMainWindow):
 
             logger.info(f"Loaded {len(clients)} clients")
 
+        except StoreUnreachable:
+            # Offline start: no client list, and no dialog. An offline list reopens from the buffer.
+            logger.warning("Clients not listed: database unreachable")
+
         except Exception as e:
             logger.exception("Error loading clients")
             QMessageBox.warning(
@@ -894,6 +966,11 @@ class MainWindow(QMainWindow):
         the whole timeout). One check at a time."""
         if self._connection_state == "checking":
             return
+        if self._run_store is not None:
+            # Database mode: base_path is the local cache, not a server to probe. An outage shows
+            # as the offline banner, and End session stays enabled (spec §8.4).
+            self._set_connection_state("ok")
+            return
         self._connection_was_down = self._connection_state == "down"
         self._set_connection_state("checking")
         path = str(self.profile_manager.base_path)
@@ -933,7 +1010,7 @@ class MainWindow(QMainWindow):
             self.connection_banner.set_outage(path, self._connection_down_since)
         # Both: the tests and the render read the banner, the layout reads the row.
         self.connection_banner.setVisible(down)
-        self._banner_row.setVisible(down)
+        self._banner_row.setVisible(down or self._db_fallback)
         self.command_bar.set_server_reachable(not down)
         self._sync_shell()
 
@@ -977,6 +1054,8 @@ class MainWindow(QMainWindow):
         """
         if self._heartbeat_busy or not (self.logic and getattr(self, "current_work_dir", None)):
             return
+        if self._run_store is not None and not self._run_store.online:
+            return  # offline: nothing to renew against; the flush checks ownership (spec §8.2)
         work_dir = Path(self.current_work_dir)
         self._heartbeat_busy = True
 
@@ -984,11 +1063,7 @@ class MainWindow(QMainWindow):
             try:
                 if self._renew_lock(work_dir):
                     self._heartbeat_lost.emit(str(work_dir))  # queued to the UI thread
-                store = self.profile_manager.store
-                if isinstance(store, BufferedStore) and not store.online:
-                    res = store.flush()
-                    if res.conflict_rel:
-                        self._offline_conflict.emit(res.conflict_rel)
+                # The offline flush is no longer here: the sync driver (P8) runs it.
             finally:
                 self._heartbeat_busy = False
 
@@ -1005,6 +1080,8 @@ class MainWindow(QMainWindow):
         A Supabase store is used when the database is reachable and signed in;
         otherwise the file share, as before.
         """
+        self._run_store = None
+        self._startup_sync_error = None  # the waiting-to-sync screen (P8) reads it
         if _use_file_store():
             return ProfileManager(config_path)
         try:
@@ -1016,41 +1093,42 @@ class MainWindow(QMainWindow):
         mode, store = open_store(
             "PackingTool-DB",
             fallback_root=fallback_root,
-            cache_dir=Path(os.path.expanduser("~")) / ".packers_assistant" / "db_cache",
-            prompt=lambda: SignInDialog.ask(self),
+            cache_dir=_db_cache_dir(),
+            prompt=lambda error: SignInDialog.ask(self, error),
             outbox_pending=pending is not None,
         )
+        pc = socket.gethostname()
         if mode is Mode.SUPABASE:
-            if pending and not self._sync_offline_outbox(store, socket.gethostname()):
-                logger.warning(f"Offline progress for {pending} is still unsynced; retried when a list starts")
-            return ProfileManager(config_path, store=store)
-        if mode is Mode.OFFLINE_BUFFER:
-            # Never the file share: that progress belongs to the database. Reconnect to sync it.
-            raise ProfileManagerError(
-                _(
-                    "This PC has unsynced progress for {list_name} and the database is "
-                    "unreachable. Reconnect and start the app again to sync it.",
-                    list_name=pending.rsplit("/", 1)[-1],
-                )
+            # One store per run: the managers and the list all write through it.
+            self._run_store = BufferedStore(
+                store, buffer_dir, pc=pc, on_change=lambda online: self._store_flipped(online)
             )
+            if pending and not self._sync_offline_outbox(self._run_store):
+                logger.warning(f"Offline progress for {pending} is still unsynced; retried when a list starts")
+            self._startup_sync_error = self._run_store.sync_error
+            return ProfileManager(config_path, store=self._run_store)
+        if mode is Mode.OFFLINE_BUFFER:
+            # The run's store over no backend, its local tree the database cache. Never the file
+            # share: that progress belongs to the database. _start_from_outbox picks the start.
+            self._run_store = BufferedStore(
+                UnreachableStore(_db_cache_dir()), buffer_dir, pc=pc,
+                on_change=lambda online: self._store_flipped(online),
+            )
+            return ProfileManager(config_path, store=self._run_store)
+        if mode is Mode.FILE:
+            self._db_fallback = True  # _init_ui shows the banner that says so
         return ProfileManager(config_path)
 
-    def _sync_offline_outbox(self, store, pc: str) -> bool:
+    def _sync_offline_outbox(self, store) -> bool:
         """Push the offline outbox, whichever run or list left it. True when nothing is unsynced."""
         if _use_file_store():
             return True
         buffer_dir = _offline_buffer_dir()
         try:
-            if not isinstance(store, BufferedStore):
-                pending = BufferedStore.pending(buffer_dir)
-                if pending is None:
-                    return True
-                if not isinstance(store, SupabaseStore):
-                    return False
-                store = BufferedStore(store, buffer_dir, list_dir=pending, pc=pc)
-            res = store.flush()
-            if res.conflict_rel:
-                self._on_offline_conflict(res.conflict_rel)
+            if isinstance(store, BufferedStore):
+                res = store.flush()
+                if res.conflict_rel:
+                    self._on_offline_conflict(res.conflict_rel)
             return BufferedStore.pending(buffer_dir) is None
         except StoreError:
             logger.exception("Offline outbox could not be synced")
@@ -1065,21 +1143,198 @@ class MainWindow(QMainWindow):
             _("Another PC took this list while you were offline. Your progress is saved as {file}.", file=rel),
         )
 
-    def _wrap_store_for_list(self, work_dir: Path):
-        """Packing a list on the database: buffer its writes while the network is down."""
-        self._unwrap_store()  # a list that failed to open may have left a wrapper for another list
-        pm = self.profile_manager
-        if not isinstance(pm.store, SupabaseStore):
-            return
-        list_dir = Path(work_dir).relative_to(pm.store.local_path("")).as_posix()
-        pm.store = BufferedStore(
-            pm.store, _offline_buffer_dir(), list_dir=list_dir, pc=self.lock_manager.hostname
-        )
+    def _start_from_outbox(self) -> bool:
+        """A pending outbox decides the start (spec §8.3). Never the file share.
 
-    def _unwrap_store(self):
-        pm = self.profile_manager
-        if isinstance(pm.store, BufferedStore):
-            pm.store = pm.store.inner
+        A permanent sync error, a finished list, or an outbox with no list.json (written before B2)
+        shows the waiting-to-sync screen. An unfinished list with the database still down reopens.
+        True when the outbox took over the start.
+        """
+        store = self._run_store
+        if store is None:
+            return False
+        buffer_dir = _offline_buffer_dir()
+        pending = BufferedStore.pending(buffer_dir)
+        if pending is None:
+            return False
+        meta = BufferedStore.pending_meta(buffer_dir)
+        if self._startup_sync_error or meta is None or store.finished():
+            self._show_waiting_to_sync(pending.rsplit("/", 1)[-1], self._startup_sync_error)
+            return True
+        if isinstance(store.inner, UnreachableStore):
+            self._resume_offline_list(meta)
+            return True
+        return False
+
+    def _resume_offline_list(self, meta: dict) -> None:
+        """Reopen the unfinished list from the buffer, offline. No lock acquire: the flush checks
+        ownership. The binding is already there from list.json, so no begin_list and no heartbeat.
+        """
+        from packing_tool.packer_logic import PackerLogic
+
+        store = self._run_store
+        client_id = meta["client_id"]
+        session_rel = f"Sessions/CLIENT_{client_id}/{meta['session_name']}"
+        work_dir = store.local_path(meta["work_dir_rel"])
+        self.current_client_id = client_id
+        self.current_worker_id = meta["worker_id"]
+        self.current_worker_name = meta["worker_name"]
+        self.current_session_path = str(store.local_path(session_rel))
+        self.current_packing_list = meta["list_name"]
+        self.current_work_dir = str(work_dir)
+        self.session_manager = SessionManager(client_id=client_id, store=store)
+        self.logic = PackerLogic(client_id=client_id, profile_manager=self.profile_manager, work_dir=str(work_dir))
+        order_count, list_name = self.logic.load_packing_list_json(
+            store.local_path(f"{session_rel}/packing_lists/{meta['list_name']}.json")
+        )
+        self.logic.item_packed.connect(self._on_item_packed)
+        self.logic.all_orders_complete.connect(self._on_all_orders_complete)
+        self.logic.save_failed.connect(self.packer_mode_widget.set_unsaved)
+        self.packing_data = {"list_name": list_name, "total_orders": order_count, "orders": []}
+        index = self.client_combo.findData(client_id)
+        if index >= 0:
+            self.client_combo.blockSignals(True)
+            self.client_combo.setCurrentIndex(index)
+            self.client_combo.blockSignals(False)
+        self.session_tabs.setCurrentIndex(PAGE_PACKING)
+        self._open_packer_document()
+        self.enable_packing_mode()
+        self._start_heartbeat_timer()  # the resumed list is ours: renew it like any open list
+
+    def _show_waiting_to_sync(self, list_name: str, error: str | None) -> None:
+        """The waiting-to-sync screen (spec §8.4): a finished list whose progress is not synced yet."""
+        self.waiting_list = (list_name, error)
+        self.waiting_page.show_state(list_name, error)
+        self.stacked_widget.setCurrentWidget(self.waiting_page)
+        self._update_sync_timer()
+
+    def _pending_list_name(self) -> str | None:
+        """The folder name of the list whose offline progress waits to sync; None when none does."""
+        if self._run_store is None:
+            return None
+        pending = BufferedStore.pending(_offline_buffer_dir())
+        return None if pending is None else pending.rsplit("/", 1)[-1]
+
+    def _refresh_offline_banner(self) -> None:
+        """The Offline banner shows while the store is offline with a list bound (spec §8.4)."""
+        store = self._run_store
+        show = store is not None and not store.online and store.bound_list() is not None
+        self._offline_row.setVisible(show)
+        self.offline_banner.setVisible(show)
+
+    def _store_flipped(self, online: bool) -> None:
+        """The buffered store's on_change: may fire on the sync thread, so it only queues the signal."""
+        self._offline_changed.emit(online)
+
+    def _on_offline_changed(self, online: bool) -> None:
+        """The store flipped (UI thread, from its on_change): the banner, the Synced toast, the timer."""
+        self._refresh_offline_banner()
+        if online:
+            self._toast(_("Synced"))
+        self._update_sync_timer()
+
+    def _update_sync_timer(self) -> None:
+        """The 60 s sync driver runs while an outbox is pending, whatever list is open (spec §8.5)."""
+        if self._pending_list_name() is not None:
+            if not self._sync_timer.isActive():
+                self._sync_timer.start()
+        else:
+            self._sync_timer.stop()
+
+    def _sync_tick(self) -> None:
+        """One sync pass on a worker thread, one at a time. Tests call this and join _sync_thread."""
+        if self._run_store is None or self._sync_busy or self._pending_list_name() is None:
+            return
+        self._sync_busy = True
+        self._sync_thread = threading.Thread(target=self._sync_run, name="offline-sync", daemon=True)
+        self._sync_thread.start()
+
+    def _sync_run(self) -> None:
+        """The worker thread: no UI calls here. Results reach the UI through the signals."""
+        store = self._run_store
+        try:
+            # Never prompt on this thread: a refused saved sign-in is asked on the UI thread.
+            # Unreachable: stay offline, the timer tries again.
+            if isinstance(store.inner, UnreachableStore) and not self._attach_database(
+                prompt=lambda _error: None
+            ):
+                return
+            self._sync_done.emit(store.flush())
+        except SignInCancelled:
+            if not self._sign_in_declined:
+                self._sign_in_needed.emit()
+        except Exception:
+            logger.exception("Offline sync failed")
+        finally:
+            self._sync_busy = False
+
+    def _sync_now(self) -> None:
+        """The packer pressed Sync now: a sign-in cancelled earlier may be asked again."""
+        self._sign_in_declined = False
+        self._sync_tick()
+
+    def _attach_database(self, prompt) -> bool:
+        """Sign in to the database and swap it in under this run's store. False while unreachable."""
+        client = db_auth.connect("PackingTool-DB", prompt=prompt)
+        if client is None:
+            return False
+        from shared.store_supabase import SupabaseStore
+
+        self._run_store.attach(SupabaseStore(client, pc=self._run_store.pc, cache_dir=_db_cache_dir()))
+        return True
+
+    def _on_sign_in_needed(self) -> None:
+        """UI thread: a saved sign-in was refused while offline. Ask here, then sync again."""
+        try:
+            attached = self._attach_database(prompt=lambda error: SignInDialog.ask(self, error))
+        except SignInCancelled:
+            self._sign_in_declined = True  # no more prompts this run; the store stays offline
+            return
+        if attached:
+            self._sync_tick()
+
+    def _on_sync_done(self, res) -> None:
+        """UI thread: a sync pass ended. A conflict is reported; the waiting screen follows the outbox."""
+        if res.conflict_rel:
+            self._on_offline_conflict(res.conflict_rel)
+        if self.stacked_widget.currentWidget() is self.waiting_page:
+            pending = self._pending_list_name()
+            if pending is None:
+                self._show_shell()
+                self.session_tabs.setCurrentIndex(PAGE_BROWSER)
+            else:
+                self._show_waiting_to_sync(pending, self._run_store.sync_error)
+        self._update_sync_timer()
+
+    @property
+    def buffered_store(self) -> BufferedStore | None:
+        """This run's store in database mode; None in file mode."""
+        return self._run_store
+
+    def _bind_list(self, client_id, session_path, work_dir, packing_list_path, packing_list_name):
+        """Bind this run's store to the list being opened: a restart offline reopens it from these."""
+        store = self.buffered_store
+        if store is None:
+            return
+        session_rel = _store_rel(store, session_path)
+        work_dir_rel = _store_rel(store, work_dir)
+        meta = {
+            "client_id": client_id,
+            "session_name": session_path.name,
+            "list_name": packing_list_name,
+            "work_dir_rel": work_dir_rel,
+            "worker_id": self.current_worker_id,
+            "worker_name": self.current_worker_name,
+            "pc": self.lock_manager.hostname,
+            "user": self.lock_manager.username,
+        }
+        snapshot = [
+            _store_rel(store, packing_list_path),
+            f"Clients/CLIENT_{client_id}/packer_config.json",
+            f"{session_rel}/{SESSION_INFO}",
+            f"{work_dir_rel}/{STATE_FILE_NAME}",  # a restart with no state write queued reads this
+        ]
+        store.begin_list(work_dir_rel, meta, snapshot)
 
     def _renew_lock(self, work_dir: Path) -> bool:
         """Renew the session lock. True when another PC has taken it (spec B3)."""
@@ -1353,8 +1608,9 @@ class MainWindow(QMainWindow):
             # The lock is taken on this thread: let the page hear about step 1.
             QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
 
-            # 1. Validate packing list file exists
-            if not packing_list_path.exists():
+            # 1. Validate packing list file exists (through the store: on Supabase it is not a local file)
+            store = self.profile_manager.store
+            if not store.exists(_store_rel(store, packing_list_path)):
                 raise FileNotFoundError(f"Packing list not found: {packing_list_path}")
 
             # 2. Store session state
@@ -1370,7 +1626,7 @@ class MainWindow(QMainWindow):
                 raise RuntimeError(error_msg)
 
             logger.info(f"Lock acquired on {work_dir}")
-            self._wrap_store_for_list(work_dir)
+            self._bind_list(client_id, session_path, work_dir, packing_list_path, packing_list_name)
 
             # 4. Start heartbeat timer
             self._start_heartbeat_timer()
@@ -1822,7 +2078,8 @@ class MainWindow(QMainWindow):
         if self.logic:
             self.logic.end_session_cleanup()
             self.logic = None
-        self._unwrap_store()
+        if self.buffered_store is not None:
+            self.buffered_store.end_list()  # unbinds unless progress is still waiting to sync
 
         # Clear Shopify session variables
         if hasattr(self, "current_work_dir"):
@@ -1921,7 +2178,11 @@ class MainWindow(QMainWindow):
 
         def switch():
             self._leaving_packer_mode = False
-            self._show_shell()
+            if self._run_store is not None and self._run_store.finished():
+                # The list was ended offline: its progress waits to sync, so the waiting screen (spec §8.4).
+                self._show_waiting_to_sync(self._pending_list_name(), self._run_store.sync_error)
+            else:
+                self._show_shell()
 
         if self.stacked_widget.currentWidget() is widget and widget.isVisible():
             self._leaving_packer_mode = True
@@ -2351,7 +2612,7 @@ class MainWindow(QMainWindow):
         (the "start packing" case); otherwise the existing work_dir is reused (resume).
         take_over is the stale lock the packer agreed to take over, or None.
         """
-        if not self._sync_offline_outbox(self.profile_manager.store, self.lock_manager.hostname):
+        if not self._sync_offline_outbox(self.profile_manager.store):
             self._toast(
                 _("This PC has offline progress that is not synced yet. Reconnect before starting another list."),
                 role="error",
