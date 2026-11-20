@@ -72,6 +72,7 @@ from packing_tool.session_manager import SessionManager
 from packing_tool.session_registry_manager import SessionRegistryManager
 from packing_tool.worker_manager import WorkerManager
 from shared import db_auth
+from shared.components.confirm_dialog import ConfirmDialog
 from shared.components.language_segment import switch_language
 from shared.components.sign_in_dialog import SignInDialog
 from shared.components.toast import toast
@@ -588,6 +589,19 @@ class MainWindow(QMainWindow):
         if index is not None:
             self.session_tabs.setCurrentIndex(index)
 
+    def _sign_out(self) -> None:
+        """Forget this PC's database sign-in, then close. No server-side sign-out: that would sign out other PCs."""
+        confirmed = ConfirmDialog.ask(
+            self,
+            title=_("Sign out of the database on this PC?"),
+            body=_("The app closes, and the next start asks for your email and password."),
+            verb=_("Sign out"),
+        )
+        if not confirmed:
+            return
+        if self.close():  # a vetoed close keeps the sign-in this run still uses
+            db_auth.forget("PackingTool-DB")
+
     def _on_page_changed(self, index: int):
         if index == PAGE_BROWSER:
             # What Sessions shows should be now, not when it was last looked at.
@@ -619,6 +633,8 @@ class MainWindow(QMainWindow):
         menu = self.command_bar.overflow
         menu.add_item(_("User guide"), self._open_user_guide)
         menu.add_item(_("Server connection…"), self._open_connection_settings)
+        if self._run_store is not None:
+            menu.add_item(_("Sign out"), self._sign_out)
         menu.add_item(_("Check for updates…"), lambda: self.update_flow.check_now())
         menu.addSeparator()
         exit_item = menu.add_item(_("Exit"), self.close)
