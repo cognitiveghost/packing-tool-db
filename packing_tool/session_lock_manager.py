@@ -399,7 +399,9 @@ class SessionLockManager:
             expected: The stale lock the user was asked about. When given, the
                 lock is taken over only if it is still that lock and still stale:
                 while the question was open its owner may have come back, or
-                another PC may have taken the list (AUDIT-02-1).
+                another PC may have taken the list (AUDIT-02-1). In DB mode a
+                missing expected means the lock as read now, so it is taken only
+                if already stale.
 
         Returns:
             True if lock was released (or taken over), False otherwise
@@ -412,7 +414,7 @@ class SessionLockManager:
             if expected is None and not isinstance(self.store, FileStore):
                 expected = lock_info  # the database takes the row only if the heartbeat is still this one
             if expected is None or not _is_valid(lock_info):
-                # Nothing to check against: remove it (an invalid file has no owner to protect)
+                # File mode, nothing to check against: remove it (an invalid file has no owner to protect)
                 self.store.delete(f"{self._dir_rel(session_dir)}/{LOCK_FILENAME}")
                 self._log_forced(lock_info, session_dir)
                 return True

@@ -82,6 +82,13 @@ def test_db_force_release_without_expected_takes_over(pcs, supabase_admin):
     assert store_b.lock_info(LIST1).holder_pc == "B"
 
 
+def test_db_force_release_without_expected_refuses_fresh_lock(pcs):
+    _, store_b, mgr_a, mgr_b, wd = pcs
+    mgr_a.acquire_lock("ZED", wd)
+    assert not mgr_b.force_release_lock(_wd(mgr_b))
+    assert store_b.lock_info(LIST1).holder_pc == "A"
+
+
 def test_db_lock_read_error_is_unreadable_not_free(pcs, monkeypatch):
     store_a, _, mgr_a, _, wd = pcs
     monkeypatch.setattr(lock_module, "LOCK_READ_RETRY_SECONDS", 0)
