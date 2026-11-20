@@ -3,7 +3,11 @@ target-version = "py314"
 
 # Project-wide rule decisions, on top of ruff's defaults.
 [lint]
+# S: flake8-bandit security checks (stand-in for a SAST scan).
+extend-select = ["S"]
 ignore = [
+    # Asserts guard invariants and are not stripped: PyInstaller builds do not run with -O.
+    "S101",
     # Codebase idiom: warehouse-floor GUI, so most I/O and Qt-callback sites
     # deliberately catch broad Exception at a boundary (worker thread, cleanup
     # handler, best-effort cache read) rather than crash the app. Narrowing
@@ -21,3 +25,9 @@ extend-immutable-calls = ["PySide6.QtCore.QModelIndex"]
 # shared/ is mirrored from the sibling repo, where a local supabase/ directory makes
 # ruff sort `supabase` as first-party. Match it so the mirror stays lint-clean.
 known-first-party = ["supabase"]
+
+[lint.per-file-ignores]
+# Tests assert, use fixture passwords and temp paths; dev scripts shell out to git and tools on PATH.
+"tests/**" = ["S"]
+"scripts/**" = ["S603", "S607"]
+"run_dev.py" = ["S603"]
