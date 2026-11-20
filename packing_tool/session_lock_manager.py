@@ -87,7 +87,10 @@ class SessionLockManager:
         """Store path (POSIX, relative to the server root) of the work folder."""
         return Path(session_dir).relative_to(self.store.local_path("")).as_posix()
 
-    def _mine(self, data: dict) -> bool:
+    def is_mine(self, data: dict) -> bool:
+        """Whether this lock is ours. In the database a lock has no process id: the same PC counts as ours."""
+        if not isinstance(self.store, FileStore):
+            return data.get('locked_by') == self.hostname
         return data.get('locked_by') == self.hostname and data.get('process_id') == self.process_id
 
     def _read(self, session_dir) -> dict | None:
@@ -99,10 +102,22 @@ class SessionLockManager:
         Invalid contents are returned as they are; the callers decide.
         """
         rel = f"{self._dir_rel(session_dir)}/{LOCK_FILENAME}"
+        db = not isinstance(self.store, FileStore)
         data = None
         last_error = None
         for attempt in range(LOCK_READ_ATTEMPTS):
             try:
+                if db:
+                    # The database has no lock file: its lock is a table row.
+                    info = self.store.lock_info(self._dir_rel(session_dir))
+                    if info is None:
+                        return None
+                    hb = info.heartbeat_at.isoformat() if info.heartbeat_at else None
+                    return {
+                        "locked_by": info.holder_pc, "user_name": info.holder_user,
+                        "lock_time": hb, "heartbeat": hb,
+                        "process_id": None, "worker_id": None, "worker_name": None,
+                    }
                 data = self.store.read_json(rel)
                 break
             except StoreNotFound:
@@ -120,6 +135,8 @@ class SessionLockManager:
         )
         now = datetime.now().astimezone().isoformat()
         try:
+            if db:
+                raise OSError  # no lock file to age: unreadable counts as fresh
             # A live owner rewrites the lock every 60 s, renewing the mtime; one left
             # empty by a crash mid-create ages out through the stale-lock prompt.
             heartbeat = datetime.fromtimestamp(
@@ -231,7 +248,7 @@ class SessionLockManager:
                 self.logger.debug(f"No lock file to release: {session_dir / LOCK_FILENAME}")
                 return True
 
-            if _is_unreadable(data) or (_is_valid(data) and not self._mine(data)):
+            if _is_unreadable(data) or (_is_valid(data) and not self.is_mine(data)):
                 # Not ours (or not readable, so not known to be free): don't delete
                 self.logger.warning(
                     "Attempted to release lock owned by another process",
@@ -303,7 +320,7 @@ class SessionLockManager:
         is_locked, info = self.is_locked(session_dir)
         if not is_locked or info.get("unreadable"):
             return None
-        return self._mine(info)
+        return self.is_mine(info)
 
     def update_heartbeat(self, session_dir: Path) -> bool:
         """
@@ -392,6 +409,8 @@ class SessionLockManager:
             if lock_info is None:
                 return True
 
+            if expected is None and not isinstance(self.store, FileStore):
+                expected = lock_info  # the database takes the row only if the heartbeat is still this one
             if expected is None or not _is_valid(lock_info):
                 # Nothing to check against: remove it (an invalid file has no owner to protect)
                 self.store.delete(f"{self._dir_rel(session_dir)}/{LOCK_FILENAME}")

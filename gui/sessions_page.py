@@ -336,11 +336,7 @@ class SessionsPage(QObject):
             return None
         if not locked or not lock:
             return None
-        ours = (
-            lock.get("locked_by") == self._locks.hostname
-            and lock.get("process_id") == self._locks.process_id
-        )
-        if ours or not self._locks.is_lock_stale(lock):
+        if self._locks.is_mine(lock) or not self._locks.is_lock_stale(lock):
             return None
         return lock
 
