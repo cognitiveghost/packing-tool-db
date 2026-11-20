@@ -599,8 +599,8 @@ class MainWindow(QMainWindow):
         )
         if not confirmed:
             return
-        db_auth.forget("PackingTool-DB")
-        self.close()
+        if self.close():  # a vetoed close keeps the sign-in this run still uses
+            db_auth.forget("PackingTool-DB")
 
     def _on_page_changed(self, index: int):
         if index == PAGE_BROWSER:
